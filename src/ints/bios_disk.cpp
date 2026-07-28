@@ -1325,6 +1325,7 @@ Bit32u imageDisk::Read_Raw(Bit8u *buffer, Bit32u seek, Bit32u len)
 	}
 	current_fpos += (Bit32u)len;
 	last_action = READ;
+	if (vhd) { vhd->current_fpos = current_fpos; vhd->last_action = sparseVhd::READ; }
 	return len;
 }
 
