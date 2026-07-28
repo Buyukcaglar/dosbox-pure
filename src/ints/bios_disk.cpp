@@ -888,7 +888,7 @@ struct sparseVhd
 		vhd_footer.sectors_per_track = (Bit8u)sect;
 		VHD_WRITE_BE32(vhd_footer.disk_type, 3); /* sparse */;
 		srand((int)timestamp);
-		for (int i = 0; i != 8; i++) vhd_footer.unique_id[i] = (Bit8u)rand();
+		for (int i = 0; i != 16; i++) vhd_footer.unique_id[i] = (Bit8u)rand();
 		vhd_footer.unique_id[8] = (vhd_footer.unique_id[8] & 0x3f) | 0x80;
 		vhd_footer.unique_id[6] = (vhd_footer.unique_id[6] & 0xf) | 0x40;
 		Bit32u vhd_footer_checksum = CalcChecksum((Bit8u*)&vhd_footer, sizeof(vhd_footer));
