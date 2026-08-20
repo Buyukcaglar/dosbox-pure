@@ -70,6 +70,9 @@ static retro_throttle_state dbp_throttle;
 static std::string dbp_crash_message;
 static std::string dbp_content_path;
 static std::string dbp_content_name;
+static std::string dbp_memory_content_path;
+static const void* dbp_memory_content_data;
+static size_t dbp_memory_content_size;
 static retro_time_t dbp_boot_time;
 static size_t dbp_serializesize;
 static Bit16s dbp_content_year, dbp_forcefps;
@@ -977,7 +980,11 @@ static DOS_Drive* DBP_Mount(unsigned image_index = 0, bool unmount_existing = tr
 		if (!unmount_existing && Drives[letter-'A']) return NULL;
 		std::string* ziperr = NULL;
 		if ((ext[3]|0x20) != 'c')
-			drive = zipDrive::MountWithDependencies(path, ziperr, dbp_strict_mode, dbp_legacy_save);
+		{
+			DOS_File* archive_file = (dbp_memory_content_data && dbp_memory_content_size && dbp_memory_content_path == path ? new memoryFile(dbp_memory_content_data, (Bit64u)dbp_memory_content_size) : NULL);
+			if (archive_file) log_cb(RETRO_LOG_INFO, "[DOSBOX] Mounting memory-backed content: %s (%llu bytes)\n", path, (unsigned long long)dbp_memory_content_size);
+			drive = zipDrive::MountWithDependencies(path, ziperr, dbp_strict_mode, dbp_legacy_save, NULL, archive_file);
+		}
 		else
 		{
 			// When loading a DOSC file, load the corresponding DOSZ file, but strip out a [VARIANT] specifier at the end.
@@ -3323,6 +3330,9 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 	//bool use_audio_callback = environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK, (void*)&rac);
 
 	if (info && info->path && *info->path) dbp_content_path = info->path;
+	dbp_memory_content_data = (info ? info->data : NULL);
+	dbp_memory_content_size = (info ? info->size : 0);
+	dbp_memory_content_path = (dbp_memory_content_data && dbp_memory_content_size ? dbp_content_path : std::string());
 	init_dosbox();
 
 	return true;
@@ -3360,6 +3370,9 @@ void retro_get_system_av_info(struct retro_system_av_info *info) // #5
 void retro_unload_game(void)
 {
 	DBP_Shutdown();
+	dbp_memory_content_data = NULL;
+	dbp_memory_content_size = 0;
+	dbp_memory_content_path.clear();
 }
 
 void retro_set_controller_port_device(unsigned port, unsigned device) //#5

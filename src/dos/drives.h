@@ -725,6 +725,58 @@ struct rawFile : public DOS_File
 	static rawFile* TryOpen(const char* path) { FILE* f = fopen_wrap(path, "rb"); return (f ? new rawFile(f, false) : NULL); }
 };
 
+// Read-only, non-owning file used for archives whose bytes remain valid in memory for the mounted drive lifetime.
+struct memoryFile : public DOS_File
+{
+	const Bit8u* data;
+	Bit64u size, pos;
+	memoryFile(const void* _data, Bit64u _size) : data((const Bit8u*)_data), size(_size), pos(0) { open = true; }
+	virtual bool Close() { if (refCtr == 1) open = false; return true; }
+	virtual bool Read(Bit8u* out, Bit16u* read_size)
+	{
+		if (!open || !data) { *read_size = 0; return false; }
+		if (pos >= size) { *read_size = 0; return true; }
+		Bit64u left = size - pos;
+		if (left < *read_size) *read_size = (Bit16u)left;
+		memcpy(out, data + (size_t)pos, *read_size);
+		pos += *read_size;
+		return true;
+	}
+	virtual bool Write(Bit8u*, Bit16u* write_size) { *write_size = 0; return false; }
+	virtual bool Seek(Bit32u* seek_pos, Bit32u type)
+	{
+		Bit64u seek64 = (type == DOS_SEEK_SET ? (Bit64u)*seek_pos : (Bit64u)(Bit64s)(Bit32s)*seek_pos);
+		bool result = Seek64(&seek64, type);
+		*seek_pos = (seek64 > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (Bit32u)seek64);
+		return result;
+	}
+	virtual bool Seek64(Bit64u* seek_pos, Bit32u type)
+	{
+		Bit64u base;
+		switch (type)
+		{
+			case DOS_SEEK_SET: base = 0; break;
+			case DOS_SEEK_CUR: base = pos; break;
+			case DOS_SEEK_END: base = size; break;
+			default: return false;
+		}
+		const Bit64s offset = (Bit64s)*seek_pos;
+		if (offset < 0)
+		{
+			const Bit64u distance = (Bit64u)(-(offset + 1)) + 1;
+			pos = (distance > base ? 0 : base - distance);
+		}
+		else
+		{
+			const Bit64u distance = (Bit64u)offset;
+			pos = (distance > size - base ? size : base + distance);
+		}
+		*seek_pos = pos;
+		return open;
+	}
+	virtual Bit16u GetInformation(void) { return 0; }
+};
+
 struct invalidFileHandle : public DOS_File
 {
 	invalidFileHandle(DOS_File& base) : DOS_File(base) { }
@@ -765,7 +817,8 @@ private:
 
 class zipDrive : public DOS_Drive {
 public:
-	static DOS_Drive* MountWithDependencies(const char* path, std::string*& error_msg, bool enable_crc_check = false, bool enter_solo_root_dir = false, const char* dosc_path = NULL);
+	// Takes ownership of archive_file when supplied. Dependencies and DOSC sidecars remain path-backed.
+	static DOS_Drive* MountWithDependencies(const char* path, std::string*& error_msg, bool enable_crc_check = false, bool enter_solo_root_dir = false, const char* dosc_path = NULL, DOS_File* archive_file = NULL);
 	zipDrive(DOS_File* zip, bool enable_crc_check = false);
 	virtual ~zipDrive();
 	virtual bool FileOpen(DOS_File * * file, char * name,Bit32u flags);

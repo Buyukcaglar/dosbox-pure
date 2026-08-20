@@ -1951,20 +1951,23 @@ struct zipDriveImpl
 	}
 };
 
-DOS_Drive* zipDrive::MountWithDependencies(const char* path, std::string*& error_msg, bool enable_crc_check, bool enter_solo_root_dir, const char* dosc_path)
+DOS_Drive* zipDrive::MountWithDependencies(const char* path, std::string*& error_msg, bool enable_crc_check, bool enter_solo_root_dir, const char* dosc_path, DOS_File* archive_file)
 {
 	struct Local
 	{
 		struct ZFILE { const char* path; const ZFILE* child; zipDriveImpl* child_impl; };
-		static DOS_Drive* Open(const ZFILE& z, std::string*& error_msg, bool enable_crc_check, bool enter_solo_root_dir, const char* dosc_path = NULL)
+		static DOS_Drive* Open(const ZFILE& z, std::string*& error_msg, bool enable_crc_check, bool enter_solo_root_dir, const char* dosc_path = NULL, DOS_File* archive_file = NULL)
 		{
 			const char* path = z.path;
 
-			DOS_File *df = NULL;
-			if (path[0] == '$' && (df = FindAndOpenDosFile(path)) != NULL)
+			DOS_File *df = archive_file;
+			if (!df && path[0] == '$' && (df = FindAndOpenDosFile(path)) != NULL)
 				df->refCtr--; // dereference what FindAndOpenDosFile did because zipDriveImpl constructor will reference it again
-			else if (FILE* zip_file_h = fopen_wrap(path, "rb"))
-				df = new rawFile(zip_file_h, false); // kept unreferenced until zipDriveImpl constructor will reference it
+			else if (!df)
+			{
+				if (FILE* zip_file_h = fopen_wrap(path, "rb"))
+					df = new rawFile(zip_file_h, false); // kept unreferenced until zipDriveImpl constructor will reference it
+			}
 
 			if (!df) return NULL;
 			bool multi_parent = false;
@@ -2021,7 +2024,7 @@ DOS_Drive* zipDrive::MountWithDependencies(const char* path, std::string*& error
 			return patch_drive;
 		}
 	};
-	return Local::Open({path, NULL, NULL}, error_msg, enable_crc_check, enter_solo_root_dir, dosc_path);
+	return Local::Open({path, NULL, NULL}, error_msg, enable_crc_check, enter_solo_root_dir, dosc_path, archive_file);
 }
 
 zipDrive::zipDrive(DOS_File* zip, bool enable_crc_check) : impl(new zipDriveImpl(zip, enable_crc_check, false))
