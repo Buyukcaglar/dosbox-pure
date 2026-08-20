@@ -1934,6 +1934,9 @@ void GFX_SetTitle(Bit32s cycles, int frameskip, bool paused)
 	extern const char* RunningProgram;
 	bool was_game_running = dbp_game_running;
 	dbp_had_game_running |= (dbp_game_running = (strcmp(RunningProgram, "DOSBOX") && strcmp(RunningProgram, "PUREMENU")));
+	#ifdef DBP_STANDALONE
+	if (!was_game_running && dbp_game_running) DBPS_CaptureStartupTextScreen();
+	#endif
 	log_cb(RETRO_LOG_INFO, "[DOSBOX STATUS] Program: %s - Cycles: %d - Frameskip: %d - Paused: %d\n", RunningProgram, cycles, frameskip, paused);
 	if (was_game_running != dbp_game_running && DOSBox_Boot) dbp_refresh_memmaps = true;
 	if (cpu.pmode && CPU_CycleAutoAdjust && CPU_OldCycleMax == 3000 && CPU_CycleMax == 3000)
@@ -2780,9 +2783,13 @@ static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::
 			return init_dosbox(forcemenu, true, dbconf);
 	}
 
+	#ifdef DBP_STANDALONE
+	DBPS_SetStartupTextModeEnabled(false);
+	#endif
 	if (DOS_Drive* drive_c = Drives['C'-'A']) // guaranteed not NULL unless dbp_skip_c_mount
 	{
 		#ifdef DBP_STANDALONE
+		DBPS_SetStartupTextModeEnabled(drive_c->FileExists("TEXTMODE.DBP"));
 		if (drive_c->FileExists(("$C:\\FRONTEND.DBP")+4))
 		{
 			DOS_File* conffile = FindAndOpenDosFile("$C:\\FRONTEND.DBP"); std::string confcontent;

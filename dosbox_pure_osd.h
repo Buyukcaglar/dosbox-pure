@@ -2677,6 +2677,66 @@ bool DBPS_IsGameRunning()
 	return (dbp_game_running || (first_shell && first_shell->bf && !first_shell->bf->IsAutoexec()));
 }
 
+static std::vector<Bit16u> dbps_startup_text_cells;
+static Bitu dbps_startup_text_width, dbps_startup_text_height;
+static PhysPt dbps_startup_text_base;
+static Bit32u dbps_startup_program_ticks;
+static bool dbps_startup_text_mode_enabled;
+
+static void DBPS_SetStartupTextModeEnabled(bool enabled)
+{
+	dbps_startup_text_mode_enabled = enabled;
+}
+
+static bool DBPS_IsTextVideoMode()
+{
+	return (vga.mode == M_TEXT || vga.mode == M_HERC_TEXT || vga.mode == M_TANDY_TEXT);
+}
+
+static void DBPS_CaptureStartupTextScreen()
+{
+	dbps_startup_text_cells.clear();
+	dbps_startup_program_ticks = DBP_GetTicks();
+	if (!CurMode || !DBPS_IsTextVideoMode()) return;
+
+	dbps_startup_text_width = CurMode->twidth;
+	dbps_startup_text_height = CurMode->theight;
+	dbps_startup_text_base = (PhysPt)(CurMode->pstart + real_readw(BIOSMEM_SEG, BIOSMEM_CURRENT_START));
+	dbps_startup_text_cells.resize(dbps_startup_text_width * dbps_startup_text_height);
+	for (size_t i = 0; i != dbps_startup_text_cells.size(); i++)
+		dbps_startup_text_cells[i] = mem_readw(dbps_startup_text_base + (PhysPt)(i * 2));
+}
+
+bool DBPS_IsStartupVideoReady()
+{
+	if (!DBPS_IsGameRunning()) return false;
+	if (!DBPS_IsTextVideoMode()) return true;
+	if (!dbps_startup_text_mode_enabled) return false;
+
+	const Bit32u startup_elapsed = (dbps_startup_program_ticks ? DBP_GetTicks() - dbps_startup_program_ticks : 0);
+	// A graphics game can briefly clear or reconfigure text mode while starting. Requiring the
+	// program to remain in text mode prevents that transition from exposing a single DOS frame.
+	if (startup_elapsed < 1000) return false;
+
+	// Full-screen text games normally replace enough cells to be distinguishable from shell startup output.
+	if (!dbps_startup_text_cells.empty() && CurMode &&
+		dbps_startup_text_width == CurMode->twidth && dbps_startup_text_height == CurMode->theight)
+	{
+		const PhysPt current_base = (PhysPt)(CurMode->pstart + real_readw(BIOSMEM_SEG, BIOSMEM_CURRENT_START));
+		if (current_base != dbps_startup_text_base) return true;
+		const size_t changed_cells_required = (dbps_startup_text_cells.size() + 2) / 3;
+		size_t changed_cells = 0;
+		for (size_t i = 0; i != dbps_startup_text_cells.size(); i++)
+			if (dbps_startup_text_cells[i] != mem_readw(current_base + (PhysPt)(i * 2)) && ++changed_cells >= changed_cells_required)
+				return true;
+	}
+	else if (!dbps_startup_text_cells.empty())
+		return true; // changing text resolution is itself a deliberate application display change
+
+	// Sparse text applications still become visible instead of remaining black indefinitely.
+	return (startup_elapsed >= 15000);
+}
+
 bool DBPS_IsShowingOSD()
 {
 	return (dbp_intercept && dbp_intercept->usegfx());

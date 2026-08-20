@@ -22,6 +22,7 @@ extern std::string DBPS_BrowsePath;
 void DBPS_OnContentLoad(const char* name, const char* dir, size_t dirlen);
 void DBPS_SubmitOSDFrame(const void *data, unsigned width, unsigned height);
 bool DBPS_IsGameRunning();
+bool DBPS_IsStartupVideoReady();
 bool DBPS_IsShowingOSD();
 void DBPS_OpenContent(const char* path);
 void DBPS_ToggleOSD();
