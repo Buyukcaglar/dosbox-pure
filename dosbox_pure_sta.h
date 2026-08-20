@@ -20,6 +20,7 @@ enum { DBPS_OSD_WIDTH = 640, DBPS_OSD_HEIGHT = 480 };
 extern int DBPS_SaveSlotIndex;
 extern std::string DBPS_BrowsePath;
 void DBPS_OnContentLoad(const char* name, const char* dir, size_t dirlen);
+const char* DBPS_GetPackageStartup();
 void DBPS_SubmitOSDFrame(const void *data, unsigned width, unsigned height);
 bool DBPS_IsGameRunning();
 bool DBPS_IsStartupVideoReady();

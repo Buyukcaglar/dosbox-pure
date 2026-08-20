@@ -2839,7 +2839,28 @@ static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::
 	{
 		bool auto_mount = true;
 		autoexec->ExecuteDestroy();
-		if (!force_puremenu && dbp_menu_time != (signed char)-1 && path_extlen == 3 && (!strncasecmp(path_ext, "EXE", 3) || !strncasecmp(path_ext, "COM", 3) || !strncasecmp(path_ext, "BAT", 3)) && !Drives['C'-'A']->FileExists("AUTOBOOT.DBP"))
+		#ifdef DBP_STANDALONE
+		const char* package_startup = DBPS_GetPackageStartup();
+		const bool custom_package_startup = (package_startup && *package_startup && strcasecmp(package_startup, "DOSBOX.BAT"));
+		#else
+		const char* package_startup = NULL;
+		const bool custom_package_startup = false;
+		#endif
+		if (!force_puremenu && custom_package_startup)
+		{
+			if (Drives['C'-'A']->FileExists(package_startup))
+			{
+				const char* extension = strrchr(package_startup, '.');
+				(((static_cast<Section_line*>(autoexec)->data += "echo off\n@") += (extension && !strcasecmp(extension, ".BAT") ? "call " : "")) += package_startup) += '\n';
+			}
+			else
+			{
+				retro_notify(0, RETRO_LOG_ERROR, "Configured package startup file was not found: %s", package_startup);
+				static_cast<Section_line*>(autoexec)->data += "echo off\n";
+			}
+			static_cast<Section_line*>(autoexec)->data += "exit\n";
+		}
+		else if (!force_puremenu && dbp_menu_time != (signed char)-1 && path_extlen == 3 && (!strncasecmp(path_ext, "EXE", 3) || !strncasecmp(path_ext, "COM", 3) || !strncasecmp(path_ext, "BAT", 3)) && !Drives['C'-'A']->FileExists("AUTOBOOT.DBP"))
 		{
 			((((((static_cast<Section_line*>(autoexec)->data += "echo off") += '\n') += ((path_ext[0]|0x20) == 'b' ? "call " : "")) += path_file) += '\n') += "Z:PUREMENU") += " -FINISH\n";
 		}
