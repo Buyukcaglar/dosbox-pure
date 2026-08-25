@@ -21,6 +21,7 @@ extern int DBPS_SaveSlotIndex;
 extern std::string DBPS_BrowsePath;
 void DBPS_OnContentLoad(const char* name, const char* dir, size_t dirlen);
 const char* DBPS_GetPackageStartup();
+bool DBPS_IsPackageTextModeEnabled();
 void DBPS_SubmitOSDFrame(const void *data, unsigned width, unsigned height);
 bool DBPS_IsGameRunning();
 bool DBPS_IsStartupVideoReady();
