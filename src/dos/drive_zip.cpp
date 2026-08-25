@@ -1080,7 +1080,9 @@ struct Zip_Archive
 		else if ((Bit64u)n > (size - seek_ofs)) n = (Bit32u)(size - seek_ofs);
 		if (seek_ofs != ofs)
 		{
-			zip->Seek64(&seek_ofs, DOS_SEEK_SET);
+			const Bit64u requested_ofs = seek_ofs;
+			if (!zip->Seek64(&seek_ofs, DOS_SEEK_SET) || seek_ofs != requested_ofs)
+				return 0;
 			ofs = seek_ofs;
 		}
 		Bit8u* pOut = (Bit8u*)pBuf;
@@ -1563,7 +1565,8 @@ void Zip_File::PICHandler(Bitu implPtr)
 
 struct Zip_Handle : public DOS_File
 {
-	Bit32u ofs;
+	// A nested ZIP can be larger than 2 GiB even though each DOS-visible member remains 32-bit sized.
+	Bit64u ofs;
 	Zip_File* src;
 
 	Zip_Handle(Zip_Archive& archive, Zip_File* _src, Bit32u _flags, zipDrive* drv, const char* path) : ofs(0), src(_src)
@@ -1616,9 +1619,9 @@ struct Zip_Handle : public DOS_File
 		if (!OPEN_IS_READING(flags)) return FALSE_SET_DOSERR(ACCESS_DENIED);
 		if (!src->unpacker) return FALSE_SET_DOSERR(INVALID_HANDLE);
 		if (!*size) return true;
-		if (ofs >= (Bit32u)src->decomp_size) { *size = 0; return true; }
-		Bit32u left = (src->decomp_size - ofs), want = (left < *size ? left : *size);
-		Bit32u read = src->unpacker->Read(*src, ofs, data, want);
+		if (ofs >= (Bit64u)src->decomp_size) { *size = 0; return true; }
+		Bit32u left = (Bit32u)((Bit64u)src->decomp_size - ofs), want = (left < *size ? left : *size);
+		Bit32u read = src->unpacker->Read(*src, (Bit32u)ofs, data, want);
 		ofs += read;
 		*size = (Bit16u)read;
 		if (!read && want) return FALSE_SET_DOSERR(INVALID_DRIVE);
@@ -1642,17 +1645,35 @@ struct Zip_Handle : public DOS_File
 	virtual bool Seek(Bit32u* pos, Bit32u type)
 	{
 		//printf("[] [%s] SEEKING %d (type: %d)\n", name, *pos, type);
-		Bit32s seekto;
+		Bit64u seek64 = (type == DOS_SEEK_SET ? (Bit64u)*pos : (Bit64u)(Bit64s)(Bit32s)*pos);
+		if (!Seek64(&seek64, type)) return false;
+		*pos = (seek64 > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (Bit32u)seek64);
+		//printf("[] [%s]    SEEKED TO %d\n", name, *pos, type);
+		return true;
+	}
+
+	virtual bool Seek64(Bit64u* pos, Bit32u type)
+	{
+		Bit64u base;
 		switch(type)
 		{
-			case DOS_SEEK_SET: seekto = (Bit32s)*pos; break;
-			case DOS_SEEK_CUR: seekto = (Bit32s)*pos + (Bit32s)ofs; break;
-			case DOS_SEEK_END: seekto = (Bit32s)src->decomp_size + (Bit32s)*pos; break;
+			case DOS_SEEK_SET: base = 0; break;
+			case DOS_SEEK_CUR: base = ofs; break;
+			case DOS_SEEK_END: base = src->decomp_size; break;
 			default: return FALSE_SET_DOSERR(FUNCTION_NUMBER_INVALID);
 		}
-		if (seekto < 0) seekto = 0;
-		*pos = ofs = (Bit32u)seekto;
-		//printf("[] [%s]    SEEKED TO %d\n", name, *pos, type);
+		const Bit64s offset = (Bit64s)*pos;
+		if (offset < 0)
+		{
+			const Bit64u distance = (Bit64u)(-(offset + 1)) + 1;
+			ofs = (distance > base ? 0 : base - distance);
+		}
+		else
+		{
+			const Bit64u distance = (Bit64u)offset;
+			ofs = (distance > (Bit64u)src->decomp_size - base ? src->decomp_size : base + distance);
+		}
+		*pos = ofs;
 		return true;
 	}
 

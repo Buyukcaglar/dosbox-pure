@@ -703,6 +703,13 @@ struct Union_WriteHandle : public DOS_File
 		return false;
 	}
 
+	virtual bool Seek64(Bit64u* pos, Bit32u type)
+	{
+		if (real_file) return real_file->Seek64(pos, type);
+		*pos = 0;
+		return false;
+	}
+
 	virtual Bit16u GetInformation(void)
 	{
 		return 0; //writable storage

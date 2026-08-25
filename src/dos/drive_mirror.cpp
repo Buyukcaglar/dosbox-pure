@@ -44,6 +44,7 @@ struct Mirror_Handle : public DOS_File
 	virtual bool Read(Bit8u* data, Bit16u* size) { return underfile->Read(data, size); }
 	virtual bool Write(Bit8u* data, Bit16u* size) { return underfile->Write(data, size); }
 	virtual bool Seek(Bit32u* pos, Bit32u type) { return underfile->Seek(pos, type); }
+	virtual bool Seek64(Bit64u* pos, Bit32u type) { return underfile->Seek64(pos, type); }
 	virtual Bit16u GetInformation(void) { return underfile->GetInformation(); }
 	virtual bool UpdateDateTimeFromHost() { return underfile->UpdateDateTimeFromHost(); }
 

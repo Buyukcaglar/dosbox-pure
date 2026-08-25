@@ -128,6 +128,7 @@ public:
 	bool Read(Bit8u * data,Bit16u * size);
 	bool Write(Bit8u * data,Bit16u * size);
 	bool Seek(Bit32u * pos,Bit32u type);
+	bool Seek64(Bit64u * pos,Bit32u type);
 	bool Close();
 	Bit16u GetInformation(void);
 	bool UpdateDateTimeFromHost(void);   

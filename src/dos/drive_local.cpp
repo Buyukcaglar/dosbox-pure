@@ -532,6 +532,24 @@ bool localFile::Seek(Bit32u * pos,Bit32u type) {
 	return true;
 }
 
+// Internal archive and image mounting can address host files beyond the DOS 32-bit seek range.
+bool localFile::Seek64(Bit64u * pos,Bit32u type) {
+	int seektype;
+	switch (type) {
+	case DOS_SEEK_SET:seektype=SEEK_SET;break;
+	case DOS_SEEK_CUR:seektype=SEEK_CUR;break;
+	case DOS_SEEK_END:seektype=SEEK_END;break;
+	default:
+		return false;
+	}
+	if (fseek_wrap(fhandle,*pos,seektype)!=0) return false;
+	const auto result=ftell_wrap(fhandle);
+	if (result<0) return false;
+	*pos=(Bit64u)result;
+	last_action=NONE;
+	return true;
+}
+
 bool localFile::Close() {
 	// only close if one reference left
 	if (refCtr==1) {
