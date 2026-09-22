@@ -152,7 +152,7 @@ struct Layout
 		for (uint32_t first = 0; first < entries; first += 128)
 		{
 			if (!source.Read(tableOffset + uint64_t(first) * 4, buf, sizeof(buf))) return "Cannot read VHD allocation table";
-			const uint32_t count = std::min(uint32_t(128), entries - first);
+			const uint32_t count = (std::min)(uint32_t(128), entries - first);
 			for (uint32_t i = 0; i < count; i++)
 			{
 				const uint32_t sector = table[first + i] = BE32(buf + i * 4);
@@ -215,6 +215,13 @@ public:
 		return true;
 	}
 	uint64_t SectorCount() const { return source ? layout.virtualSize / 512 : 0; }
+	bool Geometry(uint32_t& cylinders, uint32_t& heads, uint32_t& sectors) const
+	{
+		cylinders = uint32_t(layout.footer[56]) * 256 + layout.footer[57];
+		heads = layout.footer[58]; sectors = layout.footer[59];
+		return source && cylinders && heads && sectors && sectors <= 63 &&
+			uint64_t(cylinders) * heads * sectors <= SectorCount();
+	}
 	const char* Error() const { return error; }
 
 private:
@@ -367,7 +374,7 @@ private:
 		// publish a complete generation; never persist a partially failed child.
 		for (uint64_t written = 0; written < bytes;)
 		{
-			const size_t count = size_t(std::min(uint64_t(sizeof(zeros)), bytes - written));
+			const size_t count = size_t((std::min)(uint64_t(sizeof(zeros)), bytes - written));
 			if (!Write(offset + written, zeros, count)) return false;
 			written += count;
 		}

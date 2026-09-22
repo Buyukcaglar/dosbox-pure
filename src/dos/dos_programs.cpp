@@ -60,6 +60,16 @@ void MSCDEX_SetCDInterface(int intNr, int forceCD);
 static Bitu ZDRIVE_NUM = 25;
 
 static const char* UnmountHelper(char umount) {
+#ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
+	// Numeric unmount releases only the experimental BIOS disk; its archive
+	// drive has an independent lifetime and must retain the child save entry.
+	if (umount >= '2' && umount < '0' + MAX_DISK_IMAGES && imageDiskList[umount - '0'] && imageDiskList[umount - '0']->HasDifferencingVHD())
+	{
+		delete imageDiskList[umount - '0'];
+		if (umount == '2' || umount == '3') updateDPT();
+		return MSG_Get("PROGRAM_MOUNT_UMOUNT_SUCCESS");
+	}
+#endif
 	int i_drive;
 	if (umount < '0' || umount > 3+'0')
 		i_drive = toupper(umount) - 'A';
@@ -1457,6 +1467,12 @@ public:
 		std::string fstype = "fat";
 		cmd->FindString("-t",type,true);
 		cmd->FindString("-fs",fstype,true);
+#ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
+		std::string diff_path;
+		const bool use_diff = cmd->FindString("-diff", diff_path, true);
+		if (use_diff && (type != "hdd" || fstype != "none"))
+			{ WriteOut("Experimental -diff requires -t hdd -fs none.\n"); return; }
+#endif
 		if(type == "cdrom") type = "iso"; //Tiny hack for people who like to type -t cdrom
 
 		//Check type and exit early.
@@ -1539,6 +1555,31 @@ public:
 		}
 		
 		// find all file parameters, assuming that all option parameters have been removed
+#ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
+		if (use_diff)
+		{
+			std::string parent_path, extra;
+			if (!cmd->FindCommand(2, parent_path) || cmd->FindCommand(3, extra) || !str_size.empty() || drive < '2')
+				{ WriteOut("Experimental -diff needs one parent VHD, a hard-disk number and no -size (VHD geometry is used).\n"); return; }
+			upcase(parent_path); upcase(diff_path);
+			struct Paths { static bool Absolute(const std::string& p)
+			{
+				return p.size() >= 4 && p.size() <= 15 && p[0] >= 'A' && p[0] <= 'Z' && p[1] == ':' && p[2] == '\\';
+			}};
+			if (!Paths::Absolute(parent_path) || !Paths::Absolute(diff_path) || parent_path[0] != diff_path[0])
+				{ WriteOut("Use two root-level 8.3 VHD paths on the same archive drive, such as C:\\BASE.VHD and C:\\CHILD.VHD.\n"); return; }
+			unionDrive* overlay = dynamic_cast<unionDrive*>(Drives[parent_path[0] - 'A']);
+			if (!overlay || imageDiskList[drive - '0'])
+				{ WriteOut("Differencing VHD requires a persistent archive drive and an unused disk number.\n"); return; }
+			const char* error = NULL;
+			imageDisk* image = imageDisk::OpenDifferencingVHD(overlay, parent_path.c_str() + 3, diff_path.c_str() + 3, error);
+			if (!image) { WriteOut("Differencing VHD mount failed: %s.\n", error); return; }
+			imageDiskList[drive - '0'] = image;
+			if (drive == '2' || drive == '3') updateDPT();
+			WriteOut("Experimental differencing VHD mounted: %s with %s.\n", parent_path.c_str(), diff_path.c_str());
+			return;
+		}
+#endif
 		while(cmd->FindCommand((unsigned int)(paths.size() + 2), temp_line) && temp_line.size()) {
 #if defined(C_DBP_SUPPORT_CDROM_MOUNT_DOSFILE) && defined(C_DBP_SUPPORT_DISK_MOUNT_DOSFILE)
 			paths.emplace_back();

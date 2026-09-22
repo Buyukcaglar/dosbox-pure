@@ -850,6 +850,12 @@ public:
 	unionDrive(DOS_Drive& under, DOS_Drive& over, bool autodelete_under = false, bool autodelete_over = false);
 	unionDrive(DOS_Drive& under, const char* save_file = NULL, bool autodelete_under = false, bool strict_mode = false);
 	void AddUnder(DOS_Drive& add_under, bool autodelete_under = false);
+	// Experimental VHD mount lease. Root-level canonical 8.3 names only. Returned
+	// files own one reference each; close them before releasing the lease.
+	bool AcquireVhdFiles(const char* parent, const char* child, DOS_File** parent_file, DOS_File** child_file, bool& created, const char*& error);
+	void VhdChanged(const char* child);
+	void VhdFailed(const char* error);
+	void ReleaseVhdFiles(const char* parent, const char* child, bool remove_new_child);
 	virtual ~unionDrive();
 	virtual bool FileOpen(DOS_File * * file, char * name,Bit32u flags);
 	virtual bool FileCreate(DOS_File * * file, char * name,Bit16u attributes);

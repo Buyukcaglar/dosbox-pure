@@ -2,13 +2,13 @@
 
 `src/ints/vhd_differencing.h` implements a standard type-4 child over an
 explicitly supplied, immutable type-2 (fixed) or type-3 (dynamic) parent. This is
-an internal foundation, not an enabled emulator feature. It has no host file
-operations and is not yet connected to `imageDisk`, archive mounting or saves.
+an experimental emulator feature enabled only by explicit `IMGMOUNT -diff`.
+The codec has no host file operations.
 
 The narrow `Source` and `WritableSource` interfaces require exact random-access
-I/O. The parent interface cannot write. The eventual adapter should use
-`DOS_File`, keeping the base inside its archive and the child in the memory-backed
-overlay. Sources and the parent object must outlive their child and have exclusive
+I/O. The parent interface cannot write. `vhd_dos_source.h` adapts `DOS_File`,
+keeping the base inside its archive and the child in the memory-backed overlay.
+Sources and the parent object must outlive their child and have exclusive
 ownership while mounted. Reopening a parent invalidates existing child bindings.
 
 Supported in this first increment:
@@ -28,17 +28,37 @@ entries, and 32 MiB blocks on input; matching leading/trailing sparse footers;
 no saved-state flag, historical 511-byte footer or parent chains. Child creation
 currently accepts an ASCII parent basename. Parent locators are validated as
 metadata but never followed by this reader. UUIDs are supplied by the caller.
-The codec uses 64-bit offsets; the future `memoryDrive` adapter still needs its
-own physical-size limit because that existing implementation uses 32-bit sizes.
+The codec uses 64-bit offsets; the `memoryDrive` adapter rejects writable files
+or extensions above 2,147,483,647 bytes because its seeks use signed 32-bit sizes.
 
 VHD UUID/size/timestamp checks do **not** replace a strong fingerprint of the
 immutable parent. Package fingerprint binding, metadata opt-in, conversion of
-legacy saves, crash-safe archive publication, guest flushes, concurrent writer
+legacy saves, crash-safe archive publication, guest flushes, cross-process writer
 exclusion and save-state generation rules remain required integration work.
 The in-memory child writer alone is not a crash-safe file writer. Do not publish
 a child after a failed write; retain the last complete save generation. Child
 allocation and ordinary overwrites may leave partially changed backing bytes
 when an I/O error occurs.
+
+## Experimental mount
+
+```text
+imgmount 2 C:\BASE.VHD -t hdd -fs none -diff C:\CHILD.VHD
+boot -l c
+```
+
+Use distinct root-level 8.3 `.VHD` names on one persistent ZIP union drive.
+The parent must exist only in the immutable underlay. A legacy parent save is
+rejected without conversion. Existing children, including empty/corrupt ones,
+are validated and never reset. No host-file fallback is used. `imgmount -u 2`
+releases the disk while retaining the archive drive and saved child.
+
+Mounted names are protected against ordinary DOS writes, rename and deletion.
+Successful sector writes schedule the ordinary ZIP persistence mechanism while
+the child is open; a codec I/O fault disables all further overlay saving for the
+session. Save states and rewind are refused until disk-generation consistency
+is implemented. The existing ZIP writer is still in-place, so this interface
+is for controlled testing and is not a crash-safe production persistence feature.
 
 The child's parent timestamp is the parent's modification timestamp in seconds
 since 2000-01-01 UTC, not the creation time in its footer. `W2ru` parent locator
@@ -65,6 +85,8 @@ The suite uses independently built synthetic images and a full logical-sector
 oracle across create/write/reopen cycles. It covers zero overrides, sparse
 garbage, bitmap/block boundaries, a 5 GiB virtual disk, invalid images, parent
 mismatches and failed/partial I/O. Windows builds link `virtdisk.lib`.
+The DOS adapter tests also cover split 16-bit transfers, rejected short I/O,
+failed or truncated seeks, 64-bit parent reads and the writable-size ceiling.
 
 `-WindowsInterop` additionally writes **generated synthetic fixtures only** into
 unique directories under the test output directory and asks Windows

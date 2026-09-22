@@ -3782,6 +3782,16 @@ static bool retro_serialize_all(DBPArchive& ar, bool unlock_thread)
 	if (dbp_serializemode == DBPSERIALIZE_DISABLED) return false;
 	bool pauseThread = (dbp_state != DBPSTATE_BOOT && dbp_state != DBPSTATE_SHUTDOWN);
 	if (pauseThread) DBP_ThreadControl(TCM_PAUSE_FRAME);
+	// Child disk generations are not part of save states yet. Reject state
+	// save/load and rewind instead of combining old machine state with new disk.
+	for (imageDisk* disk : imageDiskList)
+	{
+		if (!disk || !disk->HasDifferencingVHD()) continue;
+		if (pauseThread) DBP_ThreadControl(TCM_RESUME_FRAME);
+		if (ar.mode == DBPArchive::MODE_SAVE || ar.mode == DBPArchive::MODE_LOAD)
+			retro_notify(3000, RETRO_LOG_WARN, "Save states and rewind are unavailable with experimental differencing VHDs.");
+		return false;
+	}
 	DBPSerialize_All(ar, (dbp_state == DBPSTATE_RUNNING || dbp_state == DBPSTATE_FIRST_FRAME), dbp_game_running);
 	//log_cb(RETRO_LOG_WARN, "[SERIALIZE] [%d] [%s] %u\n", ((dbp_state == DBPSTATE_RUNNING || dbp_state == DBPSTATE_FIRST_FRAME) && dbp_game_running), (ar.mode == DBPArchive::MODE_LOAD ? "LOAD" : ar.mode == DBPArchive::MODE_SAVE ? "SAVE" : ar.mode == DBPArchive::MODE_SIZE ? "SIZE" : ar.mode == DBPArchive::MODE_MAXSIZE ? "MAXX" : ar.mode == DBPArchive::MODE_ZERO ? "ZERO" : "???????"), (Bit32u)ar.GetOffset());
 	if (dbp_game_running && ar.mode == DBPArchive::MODE_LOAD) dbp_lastmenuticks = DBP_GetTicks(); // force show menu on immediate emulation crash

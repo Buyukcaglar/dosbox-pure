@@ -34,6 +34,86 @@
 #ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
 #include <time.h>
 #include <stdlib.h>
+#include <random>
+#include "vhd_dos_source.h"
+
+struct standardVhdDisk
+{
+	VhdDOSSource<DOS_File> parent_source, child_source;
+	DBPVHD::Parent parent;
+	DBPVHD::Child child;
+	DOS_File *parent_file = NULL, *child_file = NULL;
+	unionDrive* drive;
+	std::string parent_name, child_name;
+	bool created = false, leased = false, ready = false, changed = false;
+	uint32_t cylinders = 0, heads = 0, sectors = 0;
+
+	standardVhdDisk(unionDrive* d, const char* p, const char* c) : drive(d), parent_name(p), child_name(c) {}
+	~standardVhdDisk()
+	{
+		if (child_file) { child_file->Close(); delete child_file; }
+		if (parent_file) { parent_file->Close(); delete parent_file; }
+		if (ready && changed) drive->VhdChanged(child_name.c_str());
+		if (leased) drive->ReleaseVhdFiles(parent_name.c_str(), child_name.c_str(), created && !ready);
+	}
+
+	static uint32_t ArchiveTimestamp(Bit16u date, Bit16u time)
+	{
+		// ZIP/DOS timestamps have no timezone. Interpret their calendar fields as
+		// UTC for stable package binding across host timezones; clamp pre-2000.
+		const unsigned year = 1980 + (date >> 9), month = (date >> 5) & 15, day = date & 31;
+		if (year < 2000 || !month || month > 12 || !day || day > 31) return 0;
+		const unsigned daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+		unsigned days = day - 1;
+		for (unsigned y = 2000; y < year; y++) days += 365 + (!(y % 4) && ((y % 100) || !(y % 400)));
+		for (unsigned m = 1; m < month; m++) days += daysInMonth[m - 1] + (m == 2 && !(year % 4) && ((year % 100) || !(year % 400)));
+		return days * 86400U + (time >> 11) * 3600U + ((time >> 5) & 63) * 60U + (time & 31) * 2U;
+	}
+
+	bool Open(const char*& error)
+	{
+		if (!drive->AcquireVhdFiles(parent_name.c_str(), child_name.c_str(), &parent_file, &child_file, created, error)) return false;
+		leased = true;
+		if (!parent_source.Open(parent_file, false) || !child_source.Open(child_file, true))
+			{ error = "Cannot seek VHD backing file or child exceeds 2 GiB adapter limit"; return false; }
+		if (!parent.Open(parent_source, ArchiveTimestamp(parent_file->date, parent_file->time)))
+			{ error = parent.Error(); return false; }
+		if (!parent.Geometry(cylinders, heads, sectors))
+			{ error = "Parent VHD has invalid hard disk geometry"; return false; }
+		if (created)
+		{
+			std::random_device random;
+			uint8_t uuid[16];
+			for (unsigned i = 0; i < 16; i++) uuid[i] = uint8_t(random());
+			uuid[6] = (uuid[6] & 15) | 0x40; uuid[8] = (uuid[8] & 63) | 0x80;
+			if (!child.Create(child_source, parent, uuid, uint32_t(::time(NULL) - 946684800), parent_name.c_str()))
+				{ error = child.Error(); return false; }
+			changed = true;
+		}
+		else if (!child.Open(child_source, parent)) { error = child.Error(); return false; }
+		ready = true;
+		if (changed) drive->VhdChanged(child_name.c_str());
+		return true;
+	}
+
+	Bit8u ReadSector(Bit32u sector, void* data)
+	{
+		if (child.ReadSector(sector, data)) return 0;
+		if (child.IsFaulted()) drive->VhdFailed(child.Error());
+		return 0x05;
+	}
+	Bit8u WriteSector(Bit32u sector, const void* data)
+	{
+		if (!child.WriteSector(sector, data))
+		{
+			if (child.IsFaulted()) drive->VhdFailed(child.Error());
+			return 0x05;
+		}
+		changed = true;
+		drive->VhdChanged(child_name.c_str());
+		return 0;
+	}
+};
 
 struct discardDisk
 {
@@ -1220,6 +1300,7 @@ Bit8u imageDisk::Read_Sector(Bit32u head,Bit32u cylinder,Bit32u sector,void * da
 
 Bit8u imageDisk::Read_AbsoluteSector(Bit32u sectnum, void * data) {
 	#ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
+	if (standard_vhd) return standard_vhd->ReadSector(sectnum, data);
 	#ifdef C_DBP_SUPPORT_DISK_FAT_EMULATOR
 	if (ffdd) return ffdd->ReadSector(sectnum, data);
 	#endif
@@ -1266,6 +1347,7 @@ Bit8u imageDisk::Write_AbsoluteSector(Bit32u sectnum, void *data) {
 	#endif
 
 	#ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
+	if (standard_vhd) return standard_vhd->WriteSector(sectnum, data);
 	if (discard)
 	{
 		discard->Write_AbsoluteSector(sectnum, data, sector_size);
@@ -1311,6 +1393,19 @@ Bit8u imageDisk::Write_AbsoluteSector(Bit32u sectnum, void *data) {
 #ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
 Bit32u imageDisk::Read_Raw(Bit8u *buffer, Bit32u seek, Bit32u len)
 {
+	if (standard_vhd)
+	{
+		Bit32u read = 0;
+		while (read < len)
+		{
+			const Bit64u offset = (Bit64u)seek + read;
+			Bit8u sector[512];
+			if (standard_vhd->ReadSector((Bit32u)(offset / 512), sector)) break;
+			const Bit32u within = (Bit32u)(offset % 512), count = (std::min)(len - read, 512U - within);
+			memcpy(buffer + read, sector + within, count); read += count;
+		}
+		return read;
+	}
 	if (last_action == WRITE || seek != current_fpos)
 	{
 		current_fpos = seek;
@@ -1331,6 +1426,7 @@ Bit32u imageDisk::Read_Raw(Bit8u *buffer, Bit32u seek, Bit32u len)
 
 void imageDisk::SetDifferencingDisk(const char* savePath)
 {
+	if (standard_vhd) { E_Exit("Cannot layer FFDD over a standard differencing VHD"); return; }
 	if (sector_size != differencingDisk::BYTESPERSECTOR) { E_Exit("Cannot use differencing disk on image with %d bytes per sector", sector_size); return; }
 	if (discard) { delete discard; discard = NULL; }
 	if (differencing) delete differencing;
@@ -1367,6 +1463,7 @@ imageDisk::~imageDisk()
 		if (!fat_drive || fat_drive->loadedDisk != this) continue;
 		fat_drive->loadedDisk = NULL;
 	}
+	if (standard_vhd) delete standard_vhd;
 	if (dos_file)
 	{
 		if (dos_file->IsOpen()) dos_file->Close();
@@ -1386,6 +1483,29 @@ imageDisk::~imageDisk()
 #ifdef C_DBP_SUPPORT_DISK_FAT_EMULATOR
 	if (ffdd) delete ffdd;
 #endif
+}
+
+imageDisk* imageDisk::OpenDifferencingVHD(unionDrive* drive, const char* parent, const char* child, const char*& error)
+{
+	standardVhdDisk* disk = new standardVhdDisk(drive, parent, child);
+	if (!disk->Open(error)) { delete disk; return NULL; }
+	LOG_MSG("[DOSBOX] Experimental differencing VHD: %s -> %s (%llu virtual bytes)", parent, child, (unsigned long long)(disk->parent.SectorCount() * 512));
+	return new imageDisk(disk, parent);
+}
+
+bool imageDisk::UsesDifferencingVHDDrive(const unionDrive* drive) const
+{
+	return standard_vhd && standard_vhd->drive == drive;
+}
+
+imageDisk::imageDisk(standardVhdDisk* disk, const char* name)
+{
+	standard_vhd = disk;
+	dos_file = NULL;
+	current_fpos = 0; last_action = NONE; floppytype = 0;
+	hardDrive = true;
+	safe_strncpy(diskname, name, sizeof(diskname));
+	Set_Geometry(disk->heads, disk->cylinders, disk->sectors, 512);
 }
 
 imageDisk::imageDisk(DOS_File *imgFile, const char *imgName, Bit32u imgSizeK, bool isHardDisk)
@@ -1459,9 +1579,11 @@ imageDisk::imageDisk(class DOS_Drive *useDrive, Bit32u freeSpaceMB, const char* 
 Bit32u imageDisk::Set_GeometryForHardDisk()
 {
 	#ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
-	DBP_ASSERT(dos_file || ffdd);
+	DBP_ASSERT(dos_file || ffdd || standard_vhd);
 	Bit64u diskimgsize = 0;
-	if (vhd)
+	if (standard_vhd)
+		diskimgsize = standard_vhd->parent.SectorCount() * 512;
+	else if (vhd)
 		diskimgsize = (Bit64u)vhd->total_sectors * 512;
 	else if (dos_file)
 	{

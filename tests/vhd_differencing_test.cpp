@@ -1,5 +1,6 @@
 /* Standard VHD differencing tests. GPL-2.0-or-later. No emulator or host disks. */
 #include "../src/ints/vhd_differencing.h"
+#include "../src/ints/vhd_dos_source.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -291,6 +292,58 @@ static void largeVirtualDisk()
 	CHECK(!again.ReadSector(0, readBack)); CHECK(again.IsFaulted());
 }
 
+static void dosFileAdapter()
+{
+	struct File
+	{
+		uint64_t length = 200000, position = 0;
+		unsigned reads = 0, writes = 0;
+		bool failSeek = false, narrowSeek = false, shortRead = false, shortWrite = false;
+		bool Seek64(uint64_t* offset, uint32_t origin)
+		{
+			if (failSeek) return false;
+			position = origin == 2 ? length : *offset;
+			if (narrowSeek) position = uint32_t(position);
+			*offset = position;
+			return true;
+		}
+		bool Read(uint8_t* data, uint16_t* bytes)
+		{
+			reads++;
+			if (shortRead) *bytes /= 2;
+			memset(data, 0x5a, *bytes); position += *bytes;
+			return true;
+		}
+		bool Write(uint8_t*, uint16_t* bytes)
+		{
+			writes++;
+			if (shortWrite) *bytes /= 2;
+			position += *bytes;
+			if (position > length) length = position;
+			return true;
+		}
+	} file;
+	VhdDOSSource<File> reader, writer;
+	std::vector<uint8_t> data(70000);
+	CHECK(reader.Open(&file, false)); CHECK(reader.Read(500, data.data(), data.size()));
+	CHECK(file.reads == 2 && file.position == 70500 && data.back() == 0x5a);
+	CHECK(!reader.Write(0, data.data(), 1)); CHECK(file.writes == 0);
+	CHECK(!reader.Read(UINT64_MAX, data.data(), 1));
+	CHECK(!reader.Read(199999, data.data(), 2));
+	file.shortRead = true; CHECK(!reader.Read(0, data.data(), 512)); file.shortRead = false;
+	file.failSeek = true; CHECK(!reader.Read(0, data.data(), 512)); file.failSeek = false;
+	CHECK(writer.Open(&file, true)); CHECK(writer.Write(200000, data.data(), data.size()));
+	CHECK(file.writes == 2 && writer.Size() == 270000);
+	CHECK(!writer.Write(0x80000000ULL, data.data(), 1));
+	CHECK(!writer.Write(0x7fffffffULL, data.data(), 1)); CHECK(file.writes == 2);
+	file.shortWrite = true; CHECK(!writer.Write(0, data.data(), 512));
+	file.length = uint64_t(6) * 1024 * 1024 * 1024;
+	CHECK(!writer.Open(&file, true)); CHECK(!writer.Write(0, data.data(), 1)); CHECK(reader.Open(&file, false));
+	CHECK(reader.Read(0x100000000ULL, data.data(), 512)); CHECK(file.position == 0x100000200ULL);
+	file.narrowSeek = true; const unsigned reads = file.reads;
+	CHECK(!reader.Read(0x100000000ULL, data.data(), 512)); CHECK(file.reads == reads);
+}
+
 #ifdef _WIN32
 static void winCheck(DWORD status, const char* operation)
 {
@@ -365,7 +418,7 @@ static void windowsInterop()
 
 int main(int argc, char** argv)
 {
-	parentReads(); childRoundTrip(false); childRoundTrip(true); invalidImages(); ioFailures(); largeVirtualDisk();
+	parentReads(); childRoundTrip(false); childRoundTrip(true); invalidImages(); ioFailures(); largeVirtualDisk(); dosFileAdapter();
 #ifdef _WIN32
 	if (argc == 2 && !strcmp(argv[1], "--windows-interop")) windowsInterop();
 	else CHECK(argc == 1);

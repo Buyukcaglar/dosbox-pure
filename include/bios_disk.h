@@ -65,6 +65,9 @@ public:
 	~imageDisk();
 	Bit32u Read_Raw(Bit8u *buffer, Bit32u seek, Bit32u len);
 	void SetDifferencingDisk(const char* savePath);
+	static imageDisk* OpenDifferencingVHD(class unionDrive* drive, const char* parent, const char* child, const char*& error);
+	bool HasDifferencingVHD() const { return standard_vhd != NULL; }
+	bool UsesDifferencingVHDDrive(const class unionDrive* drive) const;
 	bool ExportToFile(const char* path, bool vhd_format);
 	#else
 	imageDisk(FILE *imgFile, const char *imgName, Bit32u imgSizeK, bool isHardDisk);
@@ -96,6 +99,8 @@ private:
 	struct discardDisk* discard = NULL;
 	struct differencingDisk* differencing = NULL;
 	struct sparseVhd* vhd = NULL;
+	struct standardVhdDisk* standard_vhd = NULL;
+	imageDisk(struct standardVhdDisk* disk, const char* name);
 	#else
 	Bit32u current_fpos;
 	#endif

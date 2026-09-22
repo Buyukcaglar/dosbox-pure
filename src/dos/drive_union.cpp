@@ -20,10 +20,12 @@
 #include "dos_inc.h"
 #include "drives.h"
 #include "pic.h"
+#include "bios_disk.h"
 
 #include <time.h>
 #include <vector>
 #include <climits>
+#include <utility>
 
 #define TRUE_RESET_DOSERR (dos.errorcode = save_errorcode, true)
 
@@ -150,10 +152,19 @@ struct unionDriveImpl
 	std::vector<Union_Search> searches;
 	std::vector<Bit16u> free_search_ids;
 	std::vector<Bit32u> dirty_paths;
+	std::vector<std::pair<std::string, std::string> > vhd_leases;
 	std::string save_file;
 	Bit32u save_size, free_bytes;
 	bool writable, autodelete_under, autodelete_over, dirty;
 	Bit16u modification_date, modification_time;
+	bool vhd_save_failed = false;
+
+	bool VhdLocked(const char* path) const
+	{
+		for (const auto& lease : vhd_leases)
+			if (!strcasecmp(path, lease.first.c_str()) || !strcasecmp(path, lease.second.c_str())) return true;
+		return false;
+	}
 
 	unionDriveImpl(DOS_Drive* _under, DOS_Drive* _over, const char* _save_file, bool _autodelete_under, bool _autodelete_over = false, bool strict_mode = false)
 		: save_mem(_over ? NULL : new memoryDrive()), under(_under), over(_over ? _over : save_mem), save_size(0), free_bytes(0),
@@ -208,6 +219,7 @@ struct unionDriveImpl
 
 	bool UnionUnlink(DOS_Drive* drv, char* path, Union_Modification::Type type, const Bit16u save_errorcode)
 	{
+		if (VhdLocked(path)) return FALSE_SET_DOSERR(ACCESS_DENIED);
 		if (!writable || !*path) return FALSE_SET_DOSERR(ACCESS_DENIED);
 		Union_Modification* m = modifications.Get(path);
 		if (m && m->IsDelete()) return FALSE_SET_DOSERR(FILE_NOT_FOUND);
@@ -250,6 +262,7 @@ struct unionDriveImpl
 
 	bool UnionPrepareCreate(char* path, bool can_overwrite)
 	{
+		if (VhdLocked(path)) return FALSE_SET_DOSERR(ACCESS_DENIED);
 		if (!writable || !*path) return FALSE_SET_DOSERR(ACCESS_DENIED);
 		Union_Modification* m = modifications.Get(path);
 		if (!m) { Bit16u tmp; return (can_overwrite || !under->GetFileAttr(path, &tmp) || FALSE_SET_DOSERR(FILE_ALREADY_EXISTS)); }
@@ -357,6 +370,9 @@ struct unionDriveImpl
 		}};
 
 		unionDriveImpl* impl = (unionDriveImpl*)implPtr;
+		// A failed VHD operation may have left partial bytes in memory. Keep the
+		// last on-disk generation intact; never publish those bytes on shutdown.
+		if (impl->vhd_save_failed) return;
 		LOG_MSG("[DOSBOX] Saving filesystem modifications to %s", impl->save_file.c_str());
 		FILE* fsave = fopen_wrap(impl->save_file.c_str(), "rb+");
 		bool matches_existing = !!fsave, need_truncate = matches_existing;
@@ -559,7 +575,7 @@ struct unionDriveImpl
 
 	void ScheduleSave(const char* path = NULL, float delay_ms = 0)
 	{
-		if (save_file.empty()) return;
+		if (save_file.empty() || vhd_save_failed) return;
 		if (!delay_ms)
 		{
 			// The larger the save data, the bigger the delay until we write it to disk (1 up to 60 seconds)
@@ -639,6 +655,7 @@ struct Union_WriteHandle : public DOS_File
 	virtual bool Write(Bit8u* data, Bit16u* size)
 	{
 		if (!OPEN_IS_WRITING(flags)) return FALSE_SET_DOSERR(ACCESS_DENIED);
+		if (impl->VhdLocked(name)) return FALSE_SET_DOSERR(ACCESS_DENIED);
 		if (need_copy_on_write)
 		{
 			if (!real_file) return FALSE_SET_DOSERR(INVALID_HANDLE);
@@ -734,6 +751,12 @@ void unionDrive::AddUnder(DOS_Drive& add_under, bool autodelete_under)
 
 unionDrive::~unionDrive()
 {
+	#ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
+	// Release disk handles before deleting their memory and archive backing,
+	// including drive-manager paths that delete a drive without UnMount().
+	for (imageDisk* disk : imageDiskList)
+		if (disk && disk->UsesDifferencingVHDDrive(this)) delete disk;
+	#endif
 	ForceCloseAll();
 	delete impl;
 }
@@ -743,6 +766,7 @@ bool unionDrive::FileOpen(DOS_File * * file, char * path, Bit32u flags)
 	if (!OPEN_CHECK_ACCESS_CODE(flags)) return FALSE_SET_DOSERR(ACCESS_CODE_INVALID);
 	DOSPATH_REMOVE_ENDINGDOTS_KEEP(path);
 	if (!*path) return FALSE_SET_DOSERR(ACCESS_DENIED);
+	if (OPEN_IS_WRITING(flags) && impl->VhdLocked(path)) return FALSE_SET_DOSERR(ACCESS_DENIED);
 	Union_Modification* m = impl->modifications.Get(path);
 	if (m && m->IsRedirect() && m->RedirectType() == Union_Modification::TDIR) return FALSE_SET_DOSERR(FILE_NOT_FOUND);
 	if (m && m->IsDelete()) return FALSE_SET_DOSERR(FILE_NOT_FOUND);
@@ -840,6 +864,7 @@ bool unionDrive::Rename(char * oldpath, char * newpath)
 {
 	DOSPATH_REMOVE_ENDINGDOTS(oldpath);
 	DOSPATH_REMOVE_ENDINGDOTS(newpath);
+	if (impl->VhdLocked(oldpath) || impl->VhdLocked(newpath)) return FALSE_SET_DOSERR(ACCESS_DENIED);
 	if (!impl->writable || !*oldpath || !*newpath) return FALSE_SET_DOSERR(ACCESS_DENIED);
 	if (!strcmp(oldpath, newpath)) return true; //rename with same name is always ok
 
@@ -1150,6 +1175,71 @@ Bit8u unionDrive::GetMediaByte(void) { return impl->over->GetMediaByte(); }
 bool unionDrive::isRemote(void) { return false; }
 bool unionDrive::isRemovable(void) { return false; }
 Bits unionDrive::UnMount(void) { delete this; return 0;  }
+
+bool unionDrive::AcquireVhdFiles(const char* parent, const char* child, DOS_File** parent_file, DOS_File** child_file, bool& created, const char*& error)
+{
+	*parent_file = *child_file = NULL;
+	created = false;
+	error = NULL;
+	struct Names { static bool Valid(const char* name)
+	{
+		const char* dot = strchr(name, '.');
+		if (!dot || dot == name || dot - name > 8 || strcmp(dot, ".VHD")) return false;
+		for (const char* p = name; p != dot; p++)
+			if (!(*p >= 'A' && *p <= 'Z') && !(*p >= '0' && *p <= '9') && *p != '_' && *p != '-') return false;
+		return true;
+	}};
+	if (!Names::Valid(parent) || !Names::Valid(child) || !strcmp(parent, child))
+		{ error = "Use distinct root-level 8.3 VHD names (letters, digits, _ or -)"; return false; }
+	if (!impl->save_mem || impl->save_file.empty() || !impl->writable || !dynamic_cast<zipDrive*>(impl->under))
+		{ error = "Differencing VHD requires a ZIP underlay with a persistent memory overlay"; return false; }
+	if (impl->vhd_save_failed || impl->VhdLocked(parent) || impl->VhdLocked(child))
+		{ error = "VHD is already mounted or overlay saving has failed"; return false; }
+	Bit16u attr;
+	if (impl->over->GetFileAttr((char*)parent, &attr) || impl->modifications.Get(parent))
+		{ error = "Existing full-parent save or modification requires migration; it was not changed"; return false; }
+	if (impl->under->GetFileAttr((char*)child, &attr) || impl->modifications.Get(child))
+		{ error = "Child name conflicts with archive content or a saved modification"; return false; }
+	if (!impl->under->FileOpen(parent_file, (char*)parent, OPEN_READ))
+		{ error = "Cannot open immutable VHD parent from the archive"; return false; }
+	(*parent_file)->AddRef();
+	const bool exists = impl->over->GetFileAttr((char*)child, &attr);
+	if (!(exists ? impl->over->FileOpen(child_file, (char*)child, OPEN_READWRITE) :
+		impl->over->FileCreate(child_file, (char*)child, DOS_ATTR_ARCHIVE)))
+	{
+		(*parent_file)->Close(); delete *parent_file; *parent_file = NULL;
+		error = "Cannot open or create VHD child in the memory overlay";
+		return false;
+	}
+	(*child_file)->AddRef();
+	created = !exists;
+	impl->vhd_leases.push_back(std::make_pair(std::string(parent), std::string(child)));
+	return true;
+}
+
+void unionDrive::VhdChanged(const char* child) { impl->ScheduleSave(child); }
+
+void unionDrive::VhdFailed(const char* error)
+{
+	if (impl->vhd_save_failed) return;
+	impl->vhd_save_failed = true;
+	PIC_RemoveSpecificEvents(unionDriveImpl::WriteSaveFile, (Bitu)impl);
+	LOG_MSG("[DOSBOX] VHD error: %s. Saving disabled for %s; previous save retained.", error, impl->save_file.c_str());
+	extern void emuthread_notify(int duration, LOG_SEVERITIES lvl, char const* format,...);
+	emuthread_notify(10000, LOG_ERROR, "VHD error: %s. Saving stopped; previous save retained. Restart required.", error);
+}
+
+void unionDrive::ReleaseVhdFiles(const char* parent, const char* child, bool remove_new_child)
+{
+	for (auto it = impl->vhd_leases.begin(); it != impl->vhd_leases.end(); ++it)
+	{
+		if (it->first != parent || it->second != child) continue;
+		if (remove_new_child) impl->over->FileUnlink((char*)child);
+		impl->vhd_leases.erase(it);
+		return;
+	}
+	DBP_ASSERT(false);
+}
 
 #include <dbp_serialize.h>
 DBP_SERIALIZE_SET_POINTER_LIST(PIC_EventHandler, unionDrive, unionDriveImpl::WriteSaveFile);
