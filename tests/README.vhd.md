@@ -32,13 +32,23 @@ The codec uses 64-bit offsets; the `memoryDrive` adapter rejects writable files
 or extensions above 2,147,483,647 bytes because its seeks use signed 32-bit sizes.
 
 VHD UUID/size/timestamp checks do **not** replace a strong fingerprint of the
-immutable parent. Package fingerprint binding, metadata opt-in, conversion of
-legacy saves, crash-safe archive publication, guest flushes, cross-process writer
+immutable parent. The Windows standalone host can now supply a declared identity
+and verify SHA-256 through the immutable archive handle. Conversion of legacy
+saves, crash-safe archive publication, guest flushes, cross-process writer
 exclusion and save-state generation rules remain required integration work.
 The in-memory child writer alone is not a crash-safe file writer. Do not publish
 a child after a failed write; retain the last complete save generation. Child
 allocation and ordinary overwrites may leave partially changed backing bytes
 when an I/O error occurs.
+
+`vhd_identity.h` defines the version-1, 512-byte `.DBI` binding record saved in
+the same ZIP as the child. Its exact bytes bind package/disk IDs, canonical
+parent/child names, parent SHA-256/UUID/virtual size and child UUID. It retains
+the original parent timestamp for codec validation after repacking identical
+bytes with a different ZIP timestamp. Declared packages reject existing unbound
+children; undeclared mounts reject existing bindings. Binding files are never
+silently replaced or adopted, and mounted bindings share the disk write lease.
+The enclosing repository documents the manifest opt-in and runtime tests.
 
 ## Experimental mount
 
@@ -87,6 +97,8 @@ garbage, bitmap/block boundaries, a 5 GiB virtual disk, invalid images, parent
 mismatches and failed/partial I/O. Windows builds link `virtdisk.lib`.
 The DOS adapter tests also cover split 16-bit transfers, rejected short I/O,
 failed or truncated seeks, 64-bit parent reads and the writable-size ceiling.
+Identity tests cover field changes, binding corruption, child substitution,
+canonical names, decimal overflow and retained-timestamp reopen semantics.
 
 `-WindowsInterop` additionally writes **generated synthetic fixtures only** into
 unique directories under the test output directory and asks Windows

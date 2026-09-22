@@ -1,6 +1,7 @@
 /* Standard VHD differencing tests. GPL-2.0-or-later. No emulator or host disks. */
 #include "../src/ints/vhd_differencing.h"
 #include "../src/ints/vhd_dos_source.h"
+#include "../src/ints/vhd_identity.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -416,9 +417,45 @@ static void windowsInterop()
 }
 #endif
 
+static void identityBinding()
+{
+	Memory original = fixture(true), saved;
+	DBPVHD::Identity id;
+	id.package = "org.example.win98"; id.disk = "os"; id.parent = "BASE.VHD"; id.child = "CHILD.VHD";
+	id.virtualSize = VirtualBytes; memcpy(id.parentUuid, &original.bytes[68], 16); memset(id.sha256, 0xab, 32);
+	CHECK(id.Valid());
+	uint8_t binding[512]; CHECK(id.Binding(binding, ChildId, ParentTimestamp)); CHECK(id.Matches(binding, ChildId));
+	CHECK(!id.Matches(binding, id.parentUuid));
+	for (unsigned i = 0; i < sizeof(binding); ++i)
+	{
+		if (i >= DBPVHD::Identity::TimestampOffset && i < DBPVHD::Identity::TimestampOffset + 4) continue;
+		binding[i] ^= 1; CHECK(!id.Matches(binding, ChildId)); binding[i] ^= 1;
+	}
+	DBPVHD::Identity changed = id;
+	changed.package += "2"; CHECK(!changed.Matches(binding, ChildId)); changed = id;
+	changed.disk += "2"; CHECK(!changed.Matches(binding, ChildId)); changed = id;
+	changed.parent = "OTHER.VHD"; CHECK(!changed.Matches(binding, ChildId)); changed = id;
+	changed.child = "OTHER.VHD"; CHECK(!changed.Matches(binding, ChildId)); changed = id;
+	changed.virtualSize += 512; CHECK(!changed.Matches(binding, ChildId));
+	CHECK(!DBPVHD::Identity::Name("BASE.VHD.")); CHECK(!DBPVHD::Identity::Name("..\\B.VHD"));
+	CHECK(!DBPVHD::Identity::Name("base.vhd")); CHECK(DBPVHD::Identity::Name("LONGNAME.VHD"));
+	uint64_t size; CHECK(DBPVHD::Identity::Size("2190433320960", size)); CHECK(size == UINT64_C(2190433320960));
+	CHECK(!DBPVHD::Identity::Size("18446744073709551616", size)); CHECK(!DBPVHD::Identity::Size("123x", size));
+	CHECK(!DBPVHD::Identity::Size("01", size)); CHECK(!DBPVHD::Identity::Size("", size));
+	uint8_t hex[2]; CHECK(DBPVHD::Identity::Hex("ab09", hex, 2)); CHECK(hex[0] == 0xab && hex[1] == 9);
+	CHECK(!DBPVHD::Identity::Hex("AB09", hex, 2)); CHECK(!DBPVHD::Identity::Hex("a", hex, 2));
+	// The retained timestamp is checked against the child header by the codec.
+	DBPVHD::Parent p; CHECK(p.Open(original, ParentTimestamp));
+	DBPVHD::Child child; CHECK(child.Create(saved, p, ChildId, 98765, "BASE.VHD"));
+	DBPVHD::Parent repacked; CHECK(repacked.Open(original, ParentTimestamp + 1));
+	DBPVHD::Child reopened; CHECK(!reopened.Open(saved, repacked));
+	CHECK(repacked.Open(original, DBPVHD::Detail::BE32(binding + DBPVHD::Identity::TimestampOffset)));
+	CHECK(reopened.Open(saved, repacked));
+}
+
 int main(int argc, char** argv)
 {
-	parentReads(); childRoundTrip(false); childRoundTrip(true); invalidImages(); ioFailures(); largeVirtualDisk(); dosFileAdapter();
+	parentReads(); childRoundTrip(false); childRoundTrip(true); invalidImages(); ioFailures(); largeVirtualDisk(); dosFileAdapter(); identityBinding();
 #ifdef _WIN32
 	if (argc == 2 && !strcmp(argv[1], "--windows-interop")) windowsInterop();
 	else CHECK(argc == 1);

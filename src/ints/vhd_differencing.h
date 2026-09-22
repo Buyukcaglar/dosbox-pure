@@ -215,6 +215,7 @@ public:
 		return true;
 	}
 	uint64_t SectorCount() const { return source ? layout.virtualSize / 512 : 0; }
+	const uint8_t* UniqueId() const { return layout.footer + 68; }
 	bool Geometry(uint32_t& cylinders, uint32_t& heads, uint32_t& sectors) const
 	{
 		cylinders = uint32_t(layout.footer[56]) * 256 + layout.footer[57];
@@ -238,6 +239,7 @@ private:
 class Child
 {
 public:
+	const uint8_t* UniqueId() const { return layout.footer + 68; }
 	Child() : source(NULL), parent(NULL), parentGeneration(0), error("Child is not open"), faulted(false) {}
 	bool Open(WritableSource& backing, Parent& base)
 	{

@@ -27,6 +27,11 @@
 #include <climits>
 #include <utility>
 
+static std::string VhdBindingName(const char* child)
+{
+	return std::string(child, strlen(child) - 4) + ".DBI";
+}
+
 #define TRUE_RESET_DOSERR (dos.errorcode = save_errorcode, true)
 
 static void CreateParentDirs(DOS_Drive& drv, const char* path, DOS_Drive* must_exist_in = NULL)
@@ -162,7 +167,7 @@ struct unionDriveImpl
 	bool VhdLocked(const char* path) const
 	{
 		for (const auto& lease : vhd_leases)
-			if (!strcasecmp(path, lease.first.c_str()) || !strcasecmp(path, lease.second.c_str())) return true;
+			if (!strcasecmp(path, lease.first.c_str()) || !strcasecmp(path, lease.second.c_str()) || !strcasecmp(path, VhdBindingName(lease.second.c_str()).c_str())) return true;
 		return false;
 	}
 
@@ -1200,6 +1205,9 @@ bool unionDrive::AcquireVhdFiles(const char* parent, const char* child, DOS_File
 		{ error = "Existing full-parent save or modification requires migration; it was not changed"; return false; }
 	if (impl->under->GetFileAttr((char*)child, &attr) || impl->modifications.Get(child))
 		{ error = "Child name conflicts with archive content or a saved modification"; return false; }
+	const std::string binding = VhdBindingName(child);
+	if (impl->under->GetFileAttr((char*)binding.c_str(), &attr) || impl->modifications.Get(binding.c_str()))
+		{ error = "VHD identity binding name conflicts with archive content or a saved modification"; return false; }
 	if (!impl->under->FileOpen(parent_file, (char*)parent, OPEN_READ))
 		{ error = "Cannot open immutable VHD parent from the archive"; return false; }
 	(*parent_file)->AddRef();
@@ -1218,6 +1226,40 @@ bool unionDrive::AcquireVhdFiles(const char* parent, const char* child, DOS_File
 }
 
 void unionDrive::VhdChanged(const char* child) { impl->ScheduleSave(child); }
+
+bool unionDrive::ReadVhdBinding(const char* child, Bit8u data[512], bool& exists)
+{
+	if (!impl->VhdLocked(child)) return false;
+	const std::string name = VhdBindingName(child);
+	Bit16u attr;
+	exists = impl->over->GetFileAttr((char*)name.c_str(), &attr);
+	if (!exists) return true;
+	DOS_File* file = NULL;
+	if (!impl->over->FileOpen(&file, (char*)name.c_str(), OPEN_READ)) return false;
+	file->AddRef();
+	Bit64u size = 0, position = 0;
+	Bit16u count = 512;
+	const bool ok = file->Seek64(&size, DOS_SEEK_END) && size == 512 && file->Seek64(&position, DOS_SEEK_SET) && !position && file->Read(data, &count) && count == 512;
+	file->Close(); delete file;
+	return ok;
+}
+
+bool unionDrive::CreateVhdBinding(const char* child, const Bit8u data[512])
+{
+	if (!impl->VhdLocked(child)) return false;
+	const std::string name = VhdBindingName(child);
+	Bit16u attr;
+	if (impl->over->GetFileAttr((char*)name.c_str(), &attr)) return false;
+	DOS_File* file = NULL;
+	if (!impl->over->FileCreate(&file, (char*)name.c_str(), DOS_ATTR_ARCHIVE)) return false;
+	file->AddRef();
+	Bit16u count = 512;
+	const bool ok = file->Write((Bit8u*)data, &count) && count == 512;
+	file->Close(); delete file;
+	if (!ok) impl->over->FileUnlink((char*)name.c_str());
+	else impl->ScheduleSave(name.c_str());
+	return ok;
+}
 
 void unionDrive::VhdFailed(const char* error)
 {

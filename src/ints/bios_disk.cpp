@@ -36,6 +36,11 @@
 #include <stdlib.h>
 #include <random>
 #include "vhd_dos_source.h"
+#include "vhd_identity.h"
+#ifdef DBP_STANDALONE
+extern const DBPVHD::Identity* DBPS_GetPackageVhdIdentity();
+extern bool DBPS_HashVhdSource(DBPVHD::Source& source, unsigned char digest[32]);
+#endif
 
 struct standardVhdDisk
 {
@@ -72,12 +77,38 @@ struct standardVhdDisk
 
 	bool Open(const char*& error)
 	{
+		const DBPVHD::Identity* identity = NULL;
+		#ifdef DBP_STANDALONE
+		identity = DBPS_GetPackageVhdIdentity();
+		#endif
+		if (identity && (identity->parent != parent_name || identity->child != child_name))
+			{ error = "Disk paths do not match the package differencing VHD declaration"; return false; }
 		if (!drive->AcquireVhdFiles(parent_name.c_str(), child_name.c_str(), &parent_file, &child_file, created, error)) return false;
 		leased = true;
 		if (!parent_source.Open(parent_file, false) || !child_source.Open(child_file, true))
 			{ error = "Cannot seek VHD backing file or child exceeds 2 GiB adapter limit"; return false; }
-		if (!parent.Open(parent_source, ArchiveTimestamp(parent_file->date, parent_file->time)))
+		uint8_t binding[DBPVHD::Identity::BindingSize];
+		bool has_binding = false;
+		if (!drive->ReadVhdBinding(child_name.c_str(), binding, has_binding))
+			{ error = "Cannot read VHD identity binding or binding is corrupt"; return false; }
+		if ((has_binding && (created || !identity)) || (identity && !created && !has_binding))
+			{ error = "Missing, orphaned or undeclared VHD binding; explicit migration is required"; return false; }
+		uint32_t timestamp = ArchiveTimestamp(parent_file->date, parent_file->time);
+		if (identity)
+		{
+			#ifdef DBP_STANDALONE
+			uint8_t digest[32];
+			if (!DBPS_HashVhdSource(parent_source, digest) || memcmp(digest, identity->sha256, 32))
+				{ error = "Immutable VHD parent SHA-256 does not match package metadata"; return false; }
+			#endif
+			// Binding validation below includes the child UUID. This retained
+			// timestamp permits repacking identical parent bytes into a new ZIP.
+			if (has_binding) timestamp = DBPVHD::Detail::BE32(binding + DBPVHD::Identity::TimestampOffset);
+		}
+		if (!parent.Open(parent_source, timestamp))
 			{ error = parent.Error(); return false; }
+		if (identity && (parent.SectorCount() * 512 != identity->virtualSize || memcmp(parent.UniqueId(), identity->parentUuid, 16)))
+			{ error = "VHD parent UUID or virtual size does not match package metadata"; return false; }
 		if (!parent.Geometry(cylinders, heads, sectors))
 			{ error = "Parent VHD has invalid hard disk geometry"; return false; }
 		if (created)
@@ -91,6 +122,16 @@ struct standardVhdDisk
 			changed = true;
 		}
 		else if (!child.Open(child_source, parent)) { error = child.Error(); return false; }
+		if (identity)
+		{
+			if (created)
+			{
+				if (!identity->Binding(binding, child.UniqueId(), timestamp) || !drive->CreateVhdBinding(child_name.c_str(), binding))
+					{ error = "Cannot create VHD identity binding"; return false; }
+			}
+			else if (!identity->Matches(binding, child.UniqueId()))
+				{ error = "VHD identity binding mismatch; saved disk was not changed"; return false; }
+		}
 		ready = true;
 		if (changed) drive->VhdChanged(child_name.c_str());
 		return true;

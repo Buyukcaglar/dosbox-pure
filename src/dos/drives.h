@@ -854,6 +854,8 @@ public:
 	// files own one reference each; close them before releasing the lease.
 	bool AcquireVhdFiles(const char* parent, const char* child, DOS_File** parent_file, DOS_File** child_file, bool& created, const char*& error);
 	void VhdChanged(const char* child);
+	bool ReadVhdBinding(const char* child, Bit8u data[512], bool& exists);
+	bool CreateVhdBinding(const char* child, const Bit8u data[512]);
 	void VhdFailed(const char* error);
 	void ReleaseVhdFiles(const char* parent, const char* child, bool remove_new_child);
 	virtual ~unionDrive();
