@@ -594,7 +594,7 @@ struct patchDriveImpl
 		// When loading a utility with no own files (other than DOS.YML) we keep using the files of the previously active variant (except DOS.YML)
 		const size_t oldYmlLen = patchDrive::dos_yml.size();
 		ActiveVariantIndex = LastNonUtilityVariantIndex;
-		for (IterateLayer = 0; IterateLayer == layerLast; IterateLayer++)
+		for (IterateLayer = 0; IterateLayer <= layerLast; IterateLayer++)
 			DriveFileIterator(layer_bottom[IterateLayer].patchzip, LoadFiles, (Bitu)this);
 		ActiveVariantIndex = variant_index;
 		patchDrive::dos_yml.resize(oldYmlLen);
