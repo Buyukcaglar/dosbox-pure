@@ -311,8 +311,6 @@ static const char* retro_get_variable(const char* key, const char* default_value
 void DBP_DOSBOX_ForceShutdown(const Bitu = 0);
 void DBP_CPU_ModifyCycles(const char* val, const char* params = NULL);
 void DBP_KEYBOARD_ReleaseKeys();
-void DBP_CGA_SetModelAndComposite(bool new_model, Bitu new_comp_mode);
-void DBP_Hercules_SetPalette(Bit8u pal);
 void DBP_SetMountSwappingRequested();
 Bit32u DBP_MIXER_GetFrequency();
 Bit32u DBP_MIXER_DoneSamplesCount();
@@ -1411,11 +1409,11 @@ static std::vector<std::string>& DBP_ScanSystem(bool force_midi_scan)
 			size_t ln = strlen(entry_name);
 			if (vfs.iface->dirent_is_dir(dir) && strcmp(entry_name, ".") && strcmp(entry_name, ".."))
 				subdirs.emplace_back(path.assign(subdir).append(subdir.length() ? "/" : "").append(entry_name));
-			else if ((ln > 4 && !strncasecmp(entry_name + ln - 4, ".SF", 3)) || (ln > 12 && !strcasecmp(entry_name + ln - 12, "_CONTROL.ROM")))
+			else if ((ln > 4 && !strncasecmp(entry_name + ln - 4, ".SF", 3)) || (ln > 12 && !strcasecmp(entry_name + ln - 12, "_CONTROL.ROM")) || (ln >= 8 && !strcasecmp(entry_name + ln - 8, "ROM1.BIN") && (ln < 12 || strcasecmp(entry_name + ln - 12, "WAVEROM1.BIN"))))
 			{
 				dynstr.emplace_back(path.assign(subdir).append(subdir.length() ? "/" : "").append(entry_name));
-				dynstr.emplace_back((entry_name[ln-2]|0x20) == 'f' ? "General MIDI SoundFont" : "Roland MT-32/CM-32L");
-				dynstr.back().append(": ").append(path, 0, path.size() - ((entry_name[ln-2]|0x20) == 'f' ? 4 : 12));
+				dynstr.emplace_back(((entry_name[ln-2]|0x20) == 'f') ? "General MIDI SoundFont" : ((entry_name[ln-2]|0x20) == 'o') ? "Roland MT-32/CM-32L" : "Sound Canvas SC-55");
+				dynstr.back().append(": ").append(path, 0, path.size() - (((entry_name[ln-2]|0x20) == 'f') ? 4 : ((entry_name[ln-2]|0x20) == 'o') ? 12 : 5));
 			}
 			else if (ln > 4 && (!strcasecmp(entry_name + ln - 4, ".IMG") || !strcasecmp(entry_name + ln - 4, ".IMA") || !strcasecmp(entry_name + ln - 4, ".VHD")))
 			{
@@ -1440,7 +1438,7 @@ static std::vector<std::string>& DBP_ScanSystem(bool force_midi_scan)
 				{
 					if (*p >= ' ') continue;
 					if (p == pLine) { pLine++; continue; }
-					if ((p[-3]|0x21) == 's' || dynstr.size() & 1) // check ROM/rom/SF*/sf* extension, always add description from odd rows
+					if ((p[-3]|0x21) == 's' || (p[-3]|0x20) == 'b' || (dynstr.size() & 1)) // check ROM/rom/SF*/sf*/BIN/bin extension, always add description from odd rows
 						dynstr.emplace_back(pLine, p - pLine);
 					else
 						((p[-1]|0x20) == 'z' ? dbp_shellzips : dbp_osimages).emplace_back(pLine, p - pLine);
@@ -2145,7 +2143,7 @@ static void set_variables(bool force_midi_scan = false)
 		if (((&dynstr[f].back())[-1]|0x20) == 'f') // .SF* extension soundfont
 			def.values[i++] = { dynstr[f].c_str(), dynstr[f+1].c_str() };
 	for (size_t f = 0; f != numfiles; f += 2)
-		if (((&dynstr[f].back())[-1]|0x20) != 'f') // .ROM extension munt rom
+		if (((&dynstr[f].back())[-1]|0x20) != 'f') // .ROM/.BIN extension MT32/SC55 ROM
 			def.values[i++] = { dynstr[f].c_str(), dynstr[f+1].c_str() };
 	#ifndef DBP_STANDALONE
 	def.values[i++] = { "frontend", "Frontend MIDI driver" };
@@ -2222,7 +2220,11 @@ bool DBP_Option::Apply(Section& section, const char* var_name, const char* new_v
 	Property* prop = section.GetProp(var_name);
 	if (prop->IsFixed())
 	{
-		if (user_modified) retro_notify(0, RETRO_LOG_WARN, "Unable to change setting which was fixed with game configuration");
+		if (!user_modified) return false;
+		static Bit32u lastwarnframe;
+		if (dbp_framecount == lastwarnframe) return false;
+		lastwarnframe = dbp_framecount;
+		retro_notify(0, RETRO_LOG_WARN, "Unable to change setting which was fixed with game configuration");
 		return false;
 	}
 
@@ -2345,7 +2347,7 @@ static bool check_variables()
 	visibility_changed |= DBP_Option::Apply(sec_dosbox, "machine", new_machine, false, true, machine_changed);
 	DBP_Option::GetAndApply(sec_dosbox, "vmemsize", DBP_Option::svgamem, false, true);
 	if (dbp_reboot_machine) dbp_reboot_machine = 0;
-	const char cur_mchar = (dbp_state == DBPSTATE_BOOT ? '\0' : (machine == MCH_VGA && svgaCard != SVGA_None) ? 's' : machine == MCH_CGA ? 'c' : machine == MCH_HERC ? 'h' : '\0'); // need only these 3
+	const char cur_mchar = *(const char*)sec_dosbox.GetProp("machine")->GetValue(); // query in case prop was fixed
 	const bool show_svga = (new_mchar == 's' || cur_mchar == 's'), show_cga = (new_mchar == 'c' || cur_mchar == 'c'), show_hercules = (new_mchar == 'h' || cur_mchar == 'h');
 	const char active_mchar = (dbp_state == DBPSTATE_BOOT ? new_mchar : cur_mchar);
 
@@ -2463,19 +2465,20 @@ static bool check_variables()
 	DBP_Option::SetDisplay(DBP_Option::cga, show_cga);
 	if (active_mchar == 'c')
 	{
-		const char* cga = DBP_Option::Get(DBP_Option::cga);
-		bool cga_new_model = false;
-		const char* cga_mode = NULL;
-		if (!memcmp(cga, "early_", 6)) { cga_new_model = false; cga_mode = cga + 6; }
-		if (!memcmp(cga, "late_",  5)) { cga_new_model = true;  cga_mode = cga + 5; }
-		DBP_CGA_SetModelAndComposite(cga_new_model, (!cga_mode || cga_mode[0] == 'a' ? 0 : ((cga_mode[0] == 'o' && cga_mode[1] == 'n') ? 1 : 2)));
+		bool cga_new_model = false, cga_changed = false;
+		const char* cga = DBP_Option::Get(DBP_Option::cga, &cga_changed);
+		if      (!memcmp(cga, "early_", 6)) { cga_new_model = false; cga += 6; }
+		else if (!memcmp(cga, "late_",  5)) { cga_new_model = true;  cga += 5; }
+		DBP_Option::Apply(sec_render, "cga_newmodel", (cga_new_model ? "true" : "false"), false, false, cga_changed);
+		DBP_Option::Apply(sec_render, "cga_composite", (!cga || cga[0] == 'a' ? "0" : ((cga[0] == 'o' && cga[1] == 'n') ? "1" : "2")), false, false, cga_changed);
 	}
 
 	DBP_Option::SetDisplay(DBP_Option::hercules, show_hercules);
 	if (active_mchar == 'h')
 	{
-		const char herc_mode = DBP_Option::Get(DBP_Option::hercules)[0];
-		DBP_Hercules_SetPalette(herc_mode == 'a' ? 1 : (herc_mode == 'g' ? 2 : 0));
+		bool herc_changed = false;
+		const char herc_mode = DBP_Option::Get(DBP_Option::hercules, &herc_changed)[0];
+		DBP_Option::Apply(sec_render, "hercules_palette", (herc_mode == 'a' ? "1" : (herc_mode == 'g' ? "2" : "0")), false, false, herc_changed);
 	}
 
 	const char* dbp_aspectratio = DBP_Option::Get(DBP_Option::aspect_correction);
@@ -2814,14 +2817,17 @@ static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::
 				return init_dosbox(forcemenu, true, &confcontent);
 		}
 
-		// Try to load either DOSBOX.SF2 or a pair of MT32_CONTROL.ROM/MT32_PCM.ROM from the mounted C: drive and use as fixed midi config
+		// Try to load either DOSBOX.SF2 or a pair of MT32_CONTROL.ROM/MT32_PCM.ROM or SC55 ROM1.BIN from the mounted C: drive and use as fixed midi config
 		const char* mountedMidi;
-		if (drive_c->FileExists((mountedMidi = "$C:\\DOSBOX.SF2")+4) || (drive_c->FileExists(("$C:\\MT32_PCM.ROM")+4) && (drive_c->FileExists((mountedMidi = "$C:\\MT32TROL.ROM")+4) || drive_c->FileExists((mountedMidi = "$C:\\MT32_C~1.ROM")+4))))
+		if (drive_c->FileExists((mountedMidi = "$C:\\DOSBOX.SF2")+4) || (drive_c->FileExists(("$C:\\MT32_PCM.ROM")+4) && (drive_c->FileExists((mountedMidi = "$C:\\MT32TROL.ROM")+4) || drive_c->FileExists((mountedMidi = "$C:\\MT32_C~1.ROM")+4))) || drive_c->FileExists((mountedMidi = "$C:\\ROM1.BIN")+4))
 		{
 			Section* sec = control->GetSection("midi");
-			Property* prop = sec->GetProp("midiconfig");
 			sec->ExecuteDestroy(false);
+			Property* prop = sec->GetProp("midiconfig");
 			prop->SetValue(mountedMidi);
+			prop->MarkFixed();
+			prop = sec->GetProp("mpu401");
+			prop->SetValue("intelligent");
 			prop->MarkFixed();
 			sec->ExecuteInit(false);
 		}
