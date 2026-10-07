@@ -30,6 +30,7 @@
 
 //DBP: for mem_readb_inline and mem_writeb_inline
 #include "paging.h"
+#include <dbp_serialize.h>
 
 #ifdef C_DBP_SUPPORT_DISK_MOUNT_DOSFILE
 #include <time.h>
@@ -42,9 +43,33 @@ extern const DBPVHD::Identity* DBPS_GetPackageVhdIdentity();
 extern bool DBPS_HashVhdSource(DBPVHD::Source& source, unsigned char digest[32]);
 #endif
 
+bool BIOS_VHDTestEnabled(const char* option)
+{
+	const char* root = getenv("DBP_TEST_SAVE_ROOT"), *local = getenv("LOCALAPPDATA"), *value = getenv(option);
+	return root && *root && local && !strcmp(root, local) && value && *value;
+}
+
+struct VhdRuntimeChildSource : VhdDOSSource<DOS_File>
+{
+	bool ready = false, injected = false, armed = false;
+	bool Write(uint64_t offset, const void* data, size_t bytes) override
+	{
+		if (ready && !injected && bytes > 1 && (armed || (BIOS_VHDTestEnabled("DBP_TEST_VHD_FAULT") &&
+			!strcmp(getenv("DBP_TEST_VHD_FAULT"), "short_write"))))
+		{
+			injected = true;
+			VhdDOSSource<DOS_File>::Write(offset, data, bytes / 2);
+			LOG_MSG("[DOSBOX] Milestone5 codec test: partial child write injected");
+			return false;
+		}
+		return VhdDOSSource<DOS_File>::Write(offset, data, bytes);
+	}
+};
+
 struct standardVhdDisk
 {
-	VhdDOSSource<DOS_File> parent_source, child_source;
+	VhdDOSSource<DOS_File> parent_source;
+	VhdRuntimeChildSource child_source;
 	DBPVHD::Parent parent;
 	DBPVHD::Child child;
 	DOS_File *parent_file = NULL, *child_file = NULL;
@@ -56,9 +81,9 @@ struct standardVhdDisk
 	standardVhdDisk(unionDrive* d, const char* p, const char* c) : drive(d), parent_name(p), child_name(c) {}
 	~standardVhdDisk()
 	{
+		if (ready) drive->FlushVhd();
 		if (child_file) { child_file->Close(); delete child_file; }
 		if (parent_file) { parent_file->Close(); delete parent_file; }
-		if (ready && changed) drive->VhdChanged(child_name.c_str());
 		if (leased) drive->ReleaseVhdFiles(parent_name.c_str(), child_name.c_str(), created && !ready);
 	}
 
@@ -133,6 +158,7 @@ struct standardVhdDisk
 				{ error = "VHD identity binding mismatch; saved disk was not changed"; return false; }
 		}
 		ready = true;
+		child_source.ready = true;
 		if (changed) drive->VhdChanged(child_name.c_str());
 		return true;
 	}
@@ -155,6 +181,177 @@ struct standardVhdDisk
 		return 0;
 	}
 };
+
+// States contain only mutable child bytes. The parent stays in the immutable
+// archive; this bounded private source uses the same production VHD validator.
+struct VhdStateSource : DBPVHD::WritableSource
+{
+	std::vector<Bit8u> bytes;
+	uint64_t Size() const override { return bytes.size(); }
+	bool Read(uint64_t offset, void* data, size_t count) override
+	{
+		if (offset > bytes.size() || count > bytes.size() - size_t(offset)) return false;
+		if (count) memcpy(data, &bytes[size_t(offset)], count);
+		return true;
+	}
+	bool Write(uint64_t, const void*, size_t) override { return false; }
+	uint64_t Generation() const
+	{
+		uint64_t hash = UINT64_C(14695981039346656037);
+		for (Bit8u byte : bytes) { hash ^= byte; hash *= UINT64_C(1099511628211); }
+		return hash;
+	}
+};
+
+bool BIOS_HasDifferencingVHDs()
+{
+	for (imageDisk* disk : imageDiskList) if (disk && disk->HasDifferencingVHD()) return true;
+	return false;
+}
+
+bool BIOS_VHDTestArmShortWrite(imageDisk* disk)
+{
+	if (!BIOS_VHDTestEnabled("DBP_TEST_VHD_STATE") || strcmp(getenv("DBP_TEST_VHD_STATE"), "fence")) return false;
+	standardVhdDisk* child = (disk ? disk->GetDifferencingVHD() : NULL);
+	if (!child || !child->ready || child->child.IsFaulted() || child->child_source.injected) return false;
+	child->child_source.armed = true;
+	return true;
+}
+
+bool BIOS_FlushDifferencingVHDs()
+{
+	bool ok = true;
+	for (imageDisk* disk : imageDiskList) if (disk && !disk->FlushDifferencingVHD()) ok = false;
+	return ok;
+}
+
+void BIOS_RebaseDifferencingVHDs()
+{
+	for (imageDisk* disk : imageDiskList)
+		if (standardVhdDisk* child = (disk ? disk->GetDifferencingVHD() : NULL)) child->drive->RebaseVhdCheckpoint();
+}
+
+void BIOS_FailDifferencingVHDs(const char* error)
+{
+	for (imageDisk* disk : imageDiskList)
+		if (standardVhdDisk* child = (disk ? disk->GetDifferencingVHD() : NULL)) child->drive->VhdFailed(error);
+}
+
+void DBPSerialize_VHD(DBPArchive& ar, size_t expected_machine_offset, bool (*before_restore)(void*), void* context)
+{
+	if (ar.mode == DBPArchive::MODE_ZERO) return;
+	if (ar.version < 9)
+	{
+		if (BIOS_HasDifferencingVHDs()) ar.had_error = DBPArchive::ERR_DISKSTATE;
+		return;
+	}
+	enum { SNAPSHOT_LIMIT = 512 * 1024 * 1024 };
+	Bit8u count = 0, current_count;
+	for (imageDisk* disk : imageDiskList) if (disk && disk->HasDifferencingVHD()) ++count;
+	current_count = count;
+	ar << count;
+	if (ar.had_error || count > MAX_DISK_IMAGES || count != current_count)
+		{ ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+	struct Candidate { standardVhdDisk* disk; VhdStateSource source; };
+	std::vector<Candidate> candidates(count);
+	size_t aggregate = 0;
+	Bit8u next = 0;
+	for (unsigned n = 0; n < count; ++n)
+	{
+		while (next < MAX_DISK_IMAGES && (!imageDiskList[next] || !imageDiskList[next]->HasDifferencingVHD())) ++next;
+		Bit8u slot = next++;
+		standardVhdDisk* disk = imageDiskList[slot]->GetDifferencingVHD();
+		const uint64_t physical_size = disk->child_source.Size();
+		if (!physical_size || physical_size > SNAPSHOT_LIMIT - aggregate) { ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+		Bit32u length = (Bit32u)physical_size;
+		Bit64u generation = 1;
+		Candidate& candidate = candidates[n];
+		candidate.disk = disk;
+		if (ar.mode == DBPArchive::MODE_SAVE)
+		{
+			if (!length || length > SNAPSHOT_LIMIT - aggregate) { ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+			candidate.source.bytes.resize(length);
+			if (!disk->child_source.Read(0, &candidate.source.bytes[0], length)) { ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+			generation = candidate.source.Generation();
+		}
+		char parent_name[13] = {}, child_name[13] = {};
+		memcpy(parent_name, disk->parent_name.c_str(), disk->parent_name.size());
+		memcpy(child_name, disk->child_name.c_str(), disk->child_name.size());
+		char expected_parent[13], expected_child[13];
+		memcpy(expected_parent, parent_name, sizeof(parent_name)); memcpy(expected_child, child_name, sizeof(child_name));
+		Bit8u binding[512] = {}, current_binding[512] = {};
+		bool exists = false;
+		if (!disk->ready || disk->child.IsFaulted() || disk->drive->HasPersistenceError() ||
+			!disk->drive->ReadVhdBinding(disk->child_name.c_str(), current_binding, exists))
+			{ ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+		memcpy(binding, current_binding, sizeof(binding));
+		const Bit8u expected_slot = slot;
+		ar << slot << generation << length;
+		ar.SerializeBytes(parent_name, sizeof(parent_name)).SerializeBytes(child_name, sizeof(child_name)).SerializeBytes(binding, sizeof(binding));
+		if (ar.had_error || slot != expected_slot || !generation || !length || length > SNAPSHOT_LIMIT - aggregate ||
+			memcmp(parent_name, expected_parent, sizeof(parent_name)) ||
+			memcmp(child_name, expected_child, sizeof(child_name)) || memcmp(binding, current_binding, 512))
+			{ ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+		aggregate += length;
+		if (ar.mode == DBPArchive::MODE_SIZE || ar.mode == DBPArchive::MODE_MAXSIZE)
+			{ ar.SerializeBytes(NULL, length); continue; }
+		if (ar.mode == DBPArchive::MODE_LOAD)
+		{
+			DBPArchiveReader* reader = dynamic_cast<DBPArchiveReader*>(&ar);
+			if (!reader || length > size_t(reader->end - reader->ptr)) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+		}
+		candidate.source.bytes.resize(length);
+		ar.SerializeBytes(&candidate.source.bytes[0], length);
+		if (ar.had_error) return;
+		if (ar.mode == DBPArchive::MODE_LOAD)
+		{
+			DBPVHD::Child check;
+			if (generation != candidate.source.Generation() || !check.Open(candidate.source, disk->parent) || memcmp(check.UniqueId(), disk->child.UniqueId(), 16) ||
+				(exists && memcmp(check.UniqueId(), binding + 280, 16)))
+				{ ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+		}
+	}
+	if (ar.mode != DBPArchive::MODE_LOAD) return;
+	if (expected_machine_offset && ar.GetOffset() != expected_machine_offset) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+	if (before_restore && !before_restore(context)) { ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+	// All candidates were bounded and codec/identity validated before this point.
+	// Swapping existing Memory_File vectors retains open handles and leases.
+	size_t swapped = 0;
+	for (Candidate& candidate : candidates)
+	{
+		standardVhdDisk* disk = candidate.disk;
+		if (!disk->drive->SwapVhdChild(disk->child_name.c_str(), candidate.source.bytes)) break;
+		++swapped;
+	}
+	bool ok = (swapped == candidates.size());
+	if (ok) for (Candidate& candidate : candidates)
+		if (!candidate.disk->child_source.Open(candidate.disk->child_file, true) ||
+			!candidate.disk->child.Open(candidate.disk->child_source, candidate.disk->parent)) { ok = false; break; }
+	if (!ok)
+	{
+		// The candidates now retain original bytes. Roll every completed swap
+		// back before reporting a failed restore or disabling publication.
+		for (size_t n = 0; n < swapped; ++n)
+		{
+			Candidate& candidate = candidates[n];
+			standardVhdDisk* disk = candidate.disk;
+			if (!disk->drive->SwapVhdChild(disk->child_name.c_str(), candidate.source.bytes) ||
+				!disk->child_source.Open(disk->child_file, true) || !disk->child.Open(disk->child_source, disk->parent))
+				disk->drive->VhdFailed("Cannot roll back VHD state restore");
+		}
+		ar.had_error = DBPArchive::ERR_DISKSTATE;
+		return;
+	}
+	for (Candidate& candidate : candidates)
+	{
+		standardVhdDisk* disk = candidate.disk;
+		disk->changed = true;
+		disk->drive->VhdChanged(disk->child_name.c_str());
+	}
+	for (DOS_Drive* mounted : Drives)
+		if (fatDrive* fat = (mounted ? dynamic_cast<fatDrive*>(mounted) : NULL))
+			if (fat->loadedDisk && fat->loadedDisk->HasDifferencingVHD()) fat->EmptyCache();
+}
 
 struct discardDisk
 {
@@ -1547,6 +1744,14 @@ bool imageDisk::UsesDifferencingVHDDrive(const unionDrive* drive) const
 	return standard_vhd && standard_vhd->drive == drive;
 }
 
+bool imageDisk::FlushDifferencingVHD()
+{
+	const bool ok = !standard_vhd || (standard_vhd->ready && !standard_vhd->child.IsFaulted() && standard_vhd->drive->FlushVhd());
+	if (standard_vhd && BIOS_VHDTestEnabled("DBP_TEST_VHD_LIFECYCLE"))
+		LOG_MSG("[DOSBOX] Milestone5 lifecycle test: disk flush %s", (ok ? "complete" : "failed"));
+	return ok;
+}
+
 imageDisk::imageDisk(standardVhdDisk* disk, const char* name)
 {
 	standard_vhd = disk;
@@ -1787,6 +1992,13 @@ static Bitu INT13_DiskHandler(void) {
 	switch(reg_ah) {
 	case 0x0: /* Reset disk */
 		{
+			if (drivenum < MAX_DISK_IMAGES && imageDiskList[drivenum] && !imageDiskList[drivenum]->FlushDifferencingVHD())
+			{
+				reg_ah = last_status = 0x05;
+				CALLBACK_SCF(true);
+				return CBRET_NONE;
+			}
+			if (BIOS_VHDTestEnabled("DBP_TEST_VHD_LIFECYCLE")) LOG_MSG("[DOSBOX] Milestone5 lifecycle test: BIOS disk reset flush complete");
 			/* if there aren't any diskimages (so only localdrives and virtual drives)
 			 * always succeed on reset disk. If there are diskimages then and only then
 			 * do real checks
@@ -1808,6 +2020,16 @@ static Bitu INT13_DiskHandler(void) {
 			CALLBACK_SCF(false);
 		}
         break;
+	case 0x0D: /* Reset hard disk: synchronous boundary for a standard child */
+		if (drivenum < MAX_DISK_IMAGES && imageDiskList[drivenum] && imageDiskList[drivenum]->HasDifferencingVHD())
+		{
+			const bool ok = imageDiskList[drivenum]->FlushDifferencingVHD();
+			reg_ah = last_status = (ok ? 0x00 : 0x05);
+			CALLBACK_SCF(!ok);
+			if (BIOS_VHDTestEnabled("DBP_TEST_VHD_LIFECYCLE")) LOG_MSG("[DOSBOX] Milestone5 lifecycle test: BIOS hard disk reset flush %s", (ok ? "complete" : "failed"));
+		}
+		else { reg_ah = 0xff; CALLBACK_SCF(true); }
+		break;
 	case 0x1: /* Get status of last operation */
 
 		if(last_status != 0x00) {

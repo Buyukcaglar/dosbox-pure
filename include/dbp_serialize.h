@@ -62,6 +62,7 @@ struct DBPArchive
 		ERR_WRONGMACHINECONFIG,
 		ERR_WRONGMEMORYCONFIG,
 		ERR_WRONGVGAMEMCONFIG,
+		ERR_DISKSTATE,
 	};
 	enum EWarning : Bit8u
 	{
@@ -125,7 +126,7 @@ struct DBPArchiveReader : DBPArchive
 	DBPArchiveReader(const void* _ptr, size_t _sz) : DBPArchive(DBPArchive::MODE_LOAD), start((const Bit8u*)_ptr), end(start+_sz), ptr(start) {}
 	virtual DBPArchive& SerializeByte(void* p) { if (ptr < end) *(Bit8u*)p = *(ptr++); else had_error |= ERR_LAYOUT; return *this; }
 	virtual DBPArchive& SerializeBytes(void* p, size_t sz);
-	virtual DBPArchive& Discard(size_t sz) { if (ptr + sz > end) had_error |= ERR_LAYOUT; ptr += sz; return *this; }
+	virtual DBPArchive& Discard(size_t sz) { if (sz > size_t(end - ptr)) { had_error = ERR_LAYOUT; ptr = end; } else ptr += sz; return *this; }
 	virtual size_t GetOffset() { return (ptr - start); }
 	const Bit8u *start, *end, *ptr;
 };

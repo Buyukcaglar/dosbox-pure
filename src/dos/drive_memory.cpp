@@ -435,6 +435,16 @@ bool memoryDrive::isRemote(void) { return false; }
 bool memoryDrive::isRemovable(void) { return false; }
 Bits memoryDrive::UnMount(void) { delete this; return 0;  }
 
+// Swap an already validated VHD state without invalidating the mounted DOS
+// handle's Memory_File reference or allocating during the commit step.
+bool memoryDrive::SwapFileContents(const char* path, std::vector<Bit8u>& bytes)
+{
+	Memory_Entry* entry = impl->Get(path);
+	if (!entry || !entry->IsFile() || bytes.size() > 0x7fffffffU) return false;
+	entry->AsFile()->mem_data.swap(bytes);
+	return true;
+}
+
 bool memoryDrive::CloneEntry(DOS_Drive* src_drv, const char* src_path)
 {
 	DOSPATH_REMOVE_ENDINGDOTS(src_path);
@@ -454,19 +464,23 @@ bool memoryDrive::CloneEntry(DOS_Drive* src_drv, const char* src_path)
 	else
 	{
 		e = new Memory_File(stat.attr, name, stat.date, stat.time);
-		DOS_File* df;
-		if (stat.size && src_drv->FileOpen(&df, (char*)src_path, 0))
+		DOS_File* df = NULL;
+		if (stat.size && !src_drv->FileOpen(&df, (char*)src_path, 0)) { delete e->AsFile(); return false; }
+		if (stat.size)
 		{
 			df->AddRef();
 			e->AsFile()->mem_data.resize(stat.size);
 			Bit8u* buf = &e->AsFile()->mem_data[0];
+			bool ok = true;
 			for (Bit16u read; stat.size; stat.size -= read, buf += read)
 			{
 				read = (Bit16u)(stat.size > 0xFFFF ? 0xFFFF : stat.size);
-				if (!df->Read(buf, &read)) { DBP_ASSERT(0); }
+				const Bit16u wanted = read;
+				if (!df->Read(buf, &read) || read != wanted) { ok = false; break; }
 			}
 			df->Close();
 			delete df;
+			if (!ok) { delete e->AsFile(); return false; }
 		}
 	}
 	dir->entries.Put(name, e);

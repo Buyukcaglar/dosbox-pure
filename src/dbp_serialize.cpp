@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h> /* memset, memcpy */
 #include <stdarg.h> /* va_list */
+#include <vector>
 
 // Discard should only be called for MODE_LOAD archives which need to override this function
 DBPArchive& DBPArchive::Discard(size_t sz) { DBP_ASSERT(0); return *this; }
@@ -51,6 +52,7 @@ void DBPArchive::SerializePointers(void** ptrs, size_t num_ptrs, bool ignore_unk
 			DBP_ASSERT(ignore_unknown || n != lutnum);
 		}
 		SerializeByte(&n);
+		if (had_error || n > lutnum) { had_error = ERR_LAYOUT; return; }
 		if (mode != MODE_SAVE && n != lutnum)
 			ptrs[i] = lut[n];
 	}
@@ -181,6 +183,8 @@ void DBPArchive::SerializeSparse(void* ptr, size_t sz)
 		Bit8u* p = (Bit8u*)ptr;
 		for (Serialize(skip).Serialize(len); len; Serialize(skip).Serialize(len))
 		{
+			if (had_error || skip > size_t((Bit8u*)ptr + sz - p) || len > size_t((Bit8u*)ptr + sz - p) - skip)
+				{ had_error = ERR_LAYOUT; return; }
 			memset(p, 0, skip);
 			p += skip;
 			SerializeBytes(p, len);
@@ -234,12 +238,16 @@ size_t DBPArchiveOptional::GetOffset() { return outer->GetOffset(); }
 
 DBPArchive& DBPArchiveReader::SerializeBytes(void* p, size_t sz)
 {
-	if (ptr + sz <= end) memcpy(p, ptr, sz); else had_error |= ERR_LAYOUT; ptr += sz; return *this;
+	if (sz > size_t(end - ptr)) { had_error = ERR_LAYOUT; ptr = end; }
+	else { if (sz) memcpy(p, ptr, sz); ptr += sz; }
+	return *this;
 }
 
 DBPArchive& DBPArchiveWriter::SerializeBytes(void* p, size_t sz)
 {
-	if (ptr + sz <= end) memcpy(ptr, p, sz); else had_error |= ERR_LAYOUT; ptr += sz; return *this;
+	if (sz > size_t(end - ptr)) { had_error = ERR_LAYOUT; ptr = end; }
+	else { if (sz) memcpy(ptr, p, sz); ptr += sz; }
+	return *this;
 }
 
 DBPArchive& DBPArchiveZeroer::SerializeBytes(void* p, size_t sz)
@@ -262,6 +270,42 @@ static Bit64s __rdtsc() { struct timeval tv; gettimeofday(&tv, NULL); return ((B
 #include <dosbox.h>
 #include <vga.h>
 #include <paging.h>
+#include <bios_disk.h>
+extern Bit32u DriveCalculateCRC32(const Bit8u* ptr, size_t len, Bit32u crc);
+extern bool DBPValidateStateMounts(const Bit32u hashes[2]);
+
+static bool dbp_state_rollback_active;
+struct DBPStateRollback
+{
+	DBPArchive& target;
+	bool dos_running, game_running;
+	std::vector<Bit8u> bytes;
+	DBPStateRollback(DBPArchive& ar, bool dos, bool game) : target(ar), dos_running(dos), game_running(game) {}
+	bool Prepare()
+	{
+		if (target.mode != DBPArchive::MODE_LOAD || target.version < 9 || dbp_state_rollback_active) return true;
+		DBPArchiveCounter counter;
+		DBPSerialize_All(counter, dos_running, game_running);
+		if (counter.had_error || !counter.count) return false;
+		bytes.resize(counter.count);
+		DBPArchiveWriter writer(&bytes[0], bytes.size());
+		DBPSerialize_All(writer, dos_running, game_running);
+		if (writer.had_error) { bytes.clear(); return false; }
+		return true;
+	}
+	~DBPStateRollback()
+	{
+		if (bytes.empty() || !target.had_error) return;
+		dbp_state_rollback_active = true;
+		DBPArchiveReader backup(&bytes[0], bytes.size());
+		backup.flags = target.flags;
+		DBPSerialize_All(backup, dos_running, game_running);
+		dbp_state_rollback_active = false;
+		if (backup.had_error) BIOS_FailDifferencingVHDs("Machine state rollback failed; restart required");
+	}
+};
+
+static bool DBPPrepareStateRollback(void* context) { return ((DBPStateRollback*)context)->Prepare(); }
 
 void DBPSerialize_All(DBPArchive& ar, bool dos_running, bool game_running)
 {
@@ -270,14 +314,15 @@ void DBPSerialize_All(DBPArchive& ar, bool dos_running, bool game_running)
 	Bit64s from = __rdtsc();
 	#endif
 
-	ar.version = 8;
+	ar.version = (BIOS_HasDifferencingVHDs() ? 9 : 8);
 	if (ar.mode != DBPArchive::MODE_ZERO)
 	{
 		Bit32u magic = 0xD05B5747;
 		Bit8u invalid_state = (dos_running ? 0 : 1) | (game_running ? 0 : 2);
 		ar << magic << ar.version << invalid_state;
 		if (magic != 0xD05B5747) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
-		if (ar.version < 1 || ar.version > 8) { DBP_ASSERT(false); ar.had_error = DBPArchive::ERR_VERSION; return; }
+		if (ar.had_error) return;
+		if (ar.version < 1 || ar.version > 9) { ar.had_error = DBPArchive::ERR_VERSION; return; }
 		if (ar.mode == DBPArchive::MODE_LOAD || ar.mode == DBPArchive::MODE_SAVE)
 		{
 			if (!dos_running  || (invalid_state & 1)) { ar.had_error = DBPArchive::ERR_DOSNOTRUNNING; return; }
@@ -291,6 +336,7 @@ void DBPSerialize_All(DBPArchive& ar, bool dos_running, bool game_running)
 	Bit8u serialized_vgamem = (Bit8u)(vga.vmemsize / (1024*128)), current_vgamem = serialized_vgamem;
 	DBP_ASSERT(MEM_TotalPages() == (current_memory < 225 ? current_memory : (current_memory-223)*128)*256);
 	ar << serialized_machine << serialized_memory << serialized_vgamem;
+	if (ar.had_error) return;
 	if (ar.mode == DBPArchive::MODE_LOAD)
 	{
 		if (ar.version < 5 && serialized_memory == 63) serialized_memory = 64; // will be patched in DBPSerialize_Memory
@@ -299,9 +345,32 @@ void DBPSerialize_All(DBPArchive& ar, bool dos_running, bool game_running)
 		if (serialized_vgamem  != current_vgamem)  { ar.had_error = DBPArchive::ERR_WRONGVGAMEMCONFIG;  ar.error_info = serialized_vgamem;  return; }
 	}
 
+	// Version 9 validates the complete bounded payload before touching either
+	// machine or disk state. Ordinary states retain their upstream version.
+	size_t payload_offset = 0, envelope_offset = 0;
+	if (ar.version >= 9 && ar.mode != DBPArchive::MODE_ZERO)
+	{
+		Bit64u payload_size = 0;
+		Bit32u payload_crc = 0;
+		envelope_offset = ar.GetOffset();
+		ar << payload_size << payload_crc;
+		payload_offset = ar.GetOffset();
+		if (ar.had_error) return;
+		if (ar.mode == DBPArchive::MODE_LOAD)
+		{
+			DBPArchiveReader* reader = dynamic_cast<DBPArchiveReader*>(&ar);
+			if (!reader || !payload_size || payload_size > size_t(reader->end - reader->ptr) ||
+				payload_crc != DriveCalculateCRC32(reader->ptr, size_t(payload_size), 0))
+				{ ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+			// All subsequent decoder reads are confined to the committed payload.
+			reader->end = reader->ptr + size_t(payload_size);
+		}
+	}
+
 	// The switch with __LINE__ cases is a fun way to have all the serialize functions in a list that can easily be reordered in code
 	// Small things that have an easily varying size should be put at the end to simplify a delta encoded rewind buffer
 	void (*func)(DBPArchive& ar); //const char* func_name;
+	std::vector<void (*)(DBPArchive&)> functions;
 	#define DBPSERIALIZE_GET_FUNC(FUNC) void FUNC(DBPArchive& ar); func = FUNC; //func_name = #FUNC
 	#define DBPSERIALIZE_GET_FVER(FUNC,VER_CHECK) if (!(ar.version VER_CHECK)) continue; DBPSERIALIZE_GET_FUNC(FUNC)
 	for (unsigned ln = __LINE__;; ln++)
@@ -346,10 +415,56 @@ void DBPSerialize_All(DBPArchive& ar, bool dos_running, bool game_running)
 			case __LINE__: DBPSERIALIZE_GET_FVER(DBPSerialize_Voodoo,  >=5); break;
 			case __LINE__: DBPSERIALIZE_GET_FVER(DBPSerialize_CDPlayer,>=6); break;
 			case __LINE__: DBPSERIALIZE_GET_FVER(DBPSerialize_IDE,     >=8); break;
-			case __LINE__: goto done; /*return;*/ default: continue;
+			case __LINE__: goto got_functions; default: continue;
 		}
-		//size_t old_off = ar.GetOffset();
-		func(ar);
+		functions.push_back(func);
+	}
+	got_functions:;
+	struct StateSection { Bit64u start, length; Bit32u crc, reserved; };
+	enum { MAX_SECTIONS = 64 };
+	StateSection sections[MAX_SECTIONS] = {};
+	const size_t directory_size = sizeof(sections) + sizeof(Bit32u) * 2;
+	size_t directory_offset = 0;
+	Bit32u directory_magic = 0x39444250, directory_count = (Bit32u)functions.size();
+	DBPArchiveReader* reader = (ar.mode == DBPArchive::MODE_LOAD ? dynamic_cast<DBPArchiveReader*>(&ar) : NULL);
+	DBPArchiveWriter* writer = (ar.mode == DBPArchive::MODE_SAVE ? dynamic_cast<DBPArchiveWriter*>(&ar) : NULL);
+	if (ar.version >= 9 && ar.mode != DBPArchive::MODE_ZERO)
+	{
+		if (functions.size() > MAX_SECTIONS) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+		if (reader)
+		{
+			if (size_t(reader->end - reader->ptr) < directory_size) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+			directory_offset = size_t(reader->end - reader->start) - directory_size;
+			memcpy(sections, reader->start + directory_offset, sizeof(sections));
+			memcpy(&directory_magic, reader->end - 8, 4); memcpy(&directory_count, reader->end - 4, 4);
+			if (directory_magic != 0x39444250 || directory_count != functions.size()) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+			size_t next = size_t(sections[0].start);
+			for (unsigned n = 0; n < directory_count; ++n)
+			{
+				const StateSection& section = sections[n];
+				if (section.reserved || section.start != next || section.start < ar.GetOffset() || section.start > directory_offset ||
+					section.length > directory_offset - size_t(section.start) || sizeof(size_t) > directory_offset - size_t(section.start + section.length))
+					{ ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+				const size_t end = size_t(section.start + section.length);
+				size_t stored_offset = 0; memcpy(&stored_offset, reader->start + end, sizeof(stored_offset));
+				if (stored_offset != end || section.crc != DriveCalculateCRC32(reader->start + size_t(section.start), size_t(section.length), 0))
+					{ ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+				next = end + sizeof(size_t);
+			}
+			if (next != directory_offset) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+			Bit32u mount_hashes[2];
+			if (sections[0].length != sizeof(mount_hashes)) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+			memcpy(mount_hashes, reader->start + size_t(sections[0].start), sizeof(mount_hashes));
+			if (!DBPValidateStateMounts(mount_hashes)) { ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+		}
+	}
+	DBPStateRollback rollback(ar, dos_running, game_running);
+	DBPSerialize_VHD(ar, (reader && ar.version >= 9 ? size_t(sections[0].start) : 0), DBPPrepareStateRollback, &rollback);
+	if (ar.had_error) return;
+	for (size_t n = 0; n < functions.size(); ++n)
+	{
+		const size_t section_start = ar.GetOffset();
+		functions[n](ar);
 		if (ar.had_error) return;
 		size_t off = ar.GetOffset(), offcheck = off;
 		ar << off;
@@ -359,8 +474,33 @@ void DBPSerialize_All(DBPArchive& ar, bool dos_running, bool game_running)
 			ar.had_error = DBPArchive::ERR_LAYOUT;
 			return;
 		}
+		if (writer && ar.version >= 9)
+		{
+			sections[n].start = section_start; sections[n].length = off - section_start;
+			sections[n].crc = DriveCalculateCRC32(writer->start + section_start, off - section_start, 0);
+		}
 	}
-	done:;
+	if (ar.version >= 9 && ar.mode != DBPArchive::MODE_ZERO)
+	{
+		if (reader && ar.GetOffset() != directory_offset) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+		ar.SerializeBytes(sections, sizeof(sections)) << directory_magic << directory_count;
+		if (ar.had_error) return;
+	}
+	if (ar.mode == DBPArchive::MODE_LOAD && ar.version >= 9)
+	{
+		DBPArchiveReader* reader = dynamic_cast<DBPArchiveReader*>(&ar);
+		if (!reader || reader->ptr != reader->end) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+		BIOS_RebaseDifferencingVHDs(); // restored PIC events cannot postpone the new disk timeline
+	}
+	if (ar.mode == DBPArchive::MODE_SAVE && ar.version >= 9 && !ar.had_error)
+	{
+		DBPArchiveWriter* writer = dynamic_cast<DBPArchiveWriter*>(&ar);
+		if (!writer) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
+		Bit64u payload_size = ar.GetOffset() - payload_offset;
+		Bit32u payload_crc = DriveCalculateCRC32(writer->start + payload_offset, size_t(payload_size), 0);
+		memcpy(writer->start + envelope_offset, &payload_size, sizeof(payload_size));
+		memcpy(writer->start + envelope_offset + sizeof(payload_size), &payload_crc, sizeof(payload_crc));
+	}
 	#ifdef DBP_SERIALIZE_PERF_TEST
 	if (ar.mode == DBPArchive::MODE_SAVE)
 	{

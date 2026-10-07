@@ -180,7 +180,7 @@ public:
 	virtual bool isRemote(void);
 	virtual bool isRemovable(void);
 	virtual Bits UnMount(void);
-	virtual void EmptyCache(void){}
+	virtual void EmptyCache(void){curFatSect = (Bit32u)-1;}
 public:
 	Bit8u readSector(Bit32u sectnum, void * data);
 	Bit8u writeSector(Bit32u sectnum, void * data);
@@ -811,6 +811,7 @@ public:
 	virtual Bits UnMount(void);
 
 	bool CloneEntry(DOS_Drive* src_drv, const char* src_path);
+	bool SwapFileContents(const char* path, std::vector<Bit8u>& bytes);
 private:
 	struct memoryDriveImpl* impl;
 };
@@ -854,6 +855,11 @@ public:
 	// files own one reference each; close them before releasing the lease.
 	bool AcquireVhdFiles(const char* parent, const char* child, DOS_File** parent_file, DOS_File** child_file, bool& created, const char*& error);
 	void VhdChanged(const char* child);
+	bool FlushVhd();
+	void PollVhdCheckpoint();
+	bool HasPersistenceError();
+	void RebaseVhdCheckpoint();
+	bool SwapVhdChild(const char* child, std::vector<Bit8u>& bytes);
 	bool ReadVhdBinding(const char* child, Bit8u data[512], bool& exists);
 	bool CreateVhdBinding(const char* child, const Bit8u data[512]);
 	void VhdFailed(const char* error);

@@ -68,6 +68,8 @@ public:
 	static imageDisk* OpenDifferencingVHD(class unionDrive* drive, const char* parent, const char* child, const char*& error);
 	bool HasDifferencingVHD() const { return standard_vhd != NULL; }
 	bool UsesDifferencingVHDDrive(const class unionDrive* drive) const;
+	bool FlushDifferencingVHD();
+	struct standardVhdDisk* GetDifferencingVHD() const { return standard_vhd; }
 	bool ExportToFile(const char* path, bool vhd_format);
 	#else
 	imageDisk(FILE *imgFile, const char *imgName, Bit32u imgSizeK, bool isHardDisk);
@@ -108,6 +110,13 @@ private:
 };
 
 void updateDPT(void);
+bool BIOS_FlushDifferencingVHDs();
+bool BIOS_HasDifferencingVHDs();
+void DBPSerialize_VHD(struct DBPArchive& ar, size_t expected_machine_offset = 0, bool (*before_restore)(void*) = NULL, void* context = NULL);
+void BIOS_RebaseDifferencingVHDs();
+void BIOS_FailDifferencingVHDs(const char* error);
+bool BIOS_VHDTestEnabled(const char* option);
+bool BIOS_VHDTestArmShortWrite(imageDisk* disk);
 void incrementFDD(void);
 
 //DBP: Increased from 2 to 4

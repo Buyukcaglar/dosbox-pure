@@ -202,6 +202,7 @@ struct IDEDevice {
 	}
 
 	void host_reset_begin() {    /* IDE controller -> upon setting bit 2 of alt (0x3F6) */
+		BIOS_FlushDifferencingVHDs();
 		status = 0xFF;
 		asleep = false;
 		allow_writing = true;
@@ -3212,13 +3213,24 @@ struct IDEATADevice : public IDEDevice {
 				allow_writing = true;
 				break;
 			case 0xE7: /* FLUSH CACHE */
+			case 0xEA: /* FLUSH CACHE EXT (same synchronous persistence boundary) */
 				/* NTS: Windows 2000 and Windows XP like this command a lot. They REALLY REALLY like
 				 *      to issue this command a lot, especially during the install phase. This is
 				 *      here to avoid filling your log file with many repetitions of
 				 *      "Unknown IDE/ATA command E7" */
+				if (imageDisk* disk = getBIOSdisk())
+					if (!disk->FlushDifferencingVHD())
+					{
+						feature = 0x04;
+						abort_error();
+						allow_writing = true;
+						raise_irq();
+						break;
+					}
 				status = IDE_STATUS_DRIVE_READY|IDE_STATUS_DRIVE_SEEK_COMPLETE;
 				state = IDE_DEV_READY;
 				allow_writing = true;
+				if (BIOS_VHDTestEnabled("DBP_TEST_VHD_LIFECYCLE")) LOG_MSG("[DOSBOX] Milestone5 lifecycle test: ATA flush complete");
 				raise_irq();
 				break;
 			case 0xEC: /* IDENTIFY DEVICE */

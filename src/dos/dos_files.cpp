@@ -1393,6 +1393,7 @@ void DBPSerialize_Files(DBPArchive& ar)
 		else
 		{
 			// First close all files
+			if (ar.version >= 9) Files[i]->newtime = false; // old pending FAT timestamp belongs to the old disk timeline
 			while (Files[i]->refCtr > 0) { if (Files[i]->IsOpen()) Files[i]->Close(); Files[i]->RemoveRef(); }
 			delete Files[i];
 			Files[i] = NULL;
@@ -1401,11 +1402,14 @@ void DBPSerialize_Files(DBPArchive& ar)
 	if (ar.mode == DBPArchive::MODE_MAXSIZE) openFiles = DOS_FILES;
 
 	ar << openFiles;
+	if (ar.mode == DBPArchive::MODE_LOAD && (ar.had_error || openFiles > DOS_FILES)) { ar.had_error = DBPArchive::ERR_LAYOUT; return; }
 
 	std::vector<char> buf;
 	for (Bit8u i = (Bit8u)-1; openFiles--;)
 	{
 		Bit8u drive, name_len, devnum; Bit32u flags; Bit16u attr; Bit32u refCtr, seekPos;
+		Bit16u saved_date = 0, saved_time = 0;
+		bool pending_time = false;
 		if (ar.mode == DBPArchive::MODE_SAVE || ar.mode == DBPArchive::MODE_SIZE)
 		{
 			while (!Files[++i] || !Files[i]->name || !*Files[i]->name) { }
@@ -1415,11 +1419,15 @@ void DBPSerialize_Files(DBPArchive& ar)
 			attr = Files[i]->attr;
 			refCtr = (Bit32u)Files[i]->refCtr;
 			seekPos = 0;
+			saved_date = Files[i]->date; saved_time = Files[i]->time; pending_time = Files[i]->newtime;
 			if (drive >= DOS_DRIVES) devnum = (Bit8u)dynamic_cast<DOS_Device*>(Files[i])->GetDeviceNumber();
 			else if (refCtr) Files[i]->Seek(&seekPos, DOS_SEEK_CUR);
 		}
 
 		ar << i << drive << name_len << flags << attr << refCtr << seekPos;
+		if (ar.version >= 9) ar << saved_date << saved_time << pending_time;
+		if (ar.mode == DBPArchive::MODE_LOAD && (ar.had_error || i >= DOS_FILES || refCtr > DOS_FILES || name_len >= DOS_PATHLENGTH))
+			{ ar.had_error = DBPArchive::ERR_LAYOUT; return; }
 		if (ar.mode == DBPArchive::MODE_MAXSIZE) ar.SerializeBytes(NULL, DOS_PATHLENGTH);
 		else if (drive >= DOS_DRIVES) ar << devnum;
 		else if (ar.mode != DBPArchive::MODE_LOAD) { ar.SerializeBytes(Files[i]->name, name_len); }
@@ -1429,7 +1437,7 @@ void DBPSerialize_Files(DBPArchive& ar)
 		{
 			if (drive >= DOS_DRIVES)
 			{
-				if (devnum > DOS_DEVICES || !Devices[devnum])
+				if (devnum >= DOS_DEVICES || !Devices[devnum])
 					{ ar.warnings |= DBPArchive::WARN_WRONGDEVICES; continue; }
 				Files[i] = new DOS_Device(*Devices[devnum]);
 				DBP_ASSERT(Files[i]->GetDrive() == drive);
@@ -1438,6 +1446,16 @@ void DBPSerialize_Files(DBPArchive& ar)
 			{
 				if (!refCtr) // file was closed but the DOS program still holds a handle to it
 					Files[i] = new invalidFileHandle(false, &buf[0]);
+				else if (ar.version >= 9)
+				{
+					// A rejected VHD machine-state load must not create/truncate an
+					// unrelated overlay file that its rollback does not snapshot.
+					// Attribute lookup also prevents failed writable union opens
+					// from cleaning a redirect whose source no longer exists.
+					Bit16u current_attr;
+					if (!Drives[drive] || !Drives[drive]->GetFileAttr(&buf[0], &current_attr) || !Drives[drive]->FileOpen(&Files[i], &buf[0], flags))
+						{ ar.had_error = DBPArchive::ERR_DISKSTATE; return; }
+				}
 				else if (!Drives[drive] || (!Drives[drive]->FileOpen(&Files[i], &buf[0], flags) && (!OPEN_IS_WRITING(flags) || !Drives[drive]->FileCreate(&Files[i], &buf[0], attr))))
 					{ Files[i] = new invalidFileHandle(true, &buf[0]); ar.warnings |= DBPArchive::WARN_WRONGDRIVES; }
 				Files[i]->SetDrive(drive);
@@ -1446,6 +1464,7 @@ void DBPSerialize_Files(DBPArchive& ar)
 			Files[i]->flags = flags;
 			Files[i]->attr = attr;
 			Files[i]->refCtr = (Bits)refCtr;
+			if (ar.version >= 9) { Files[i]->date = saved_date; Files[i]->time = saved_time; Files[i]->newtime = pending_time; }
 			if (seekPos) Files[i]->Seek(&seekPos, DOS_SEEK_SET);
 		}
 	}

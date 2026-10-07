@@ -60,6 +60,8 @@ static retro_system_av_info av_info;
 static enum DBP_State : Bit8u { DBPSTATE_BOOT, DBPSTATE_EXITED, DBPSTATE_SHUTDOWN, DBPSTATE_REBOOT, DBPSTATE_FIRST_FRAME, DBPSTATE_RUNNING } dbp_state;
 static enum DBP_SerializeMode : Bit8u { DBPSERIALIZE_STATES, DBPSERIALIZE_REWIND, DBPSERIALIZE_DISABLED } dbp_serializemode;
 static bool dbp_game_running, dbp_pause_events, dbp_paused_midframe, dbp_frame_pending, dbp_biosreboot, dbp_biospoweroff, dbp_system_cached, dbp_system_scannable, dbp_refresh_memmaps;
+static bool dbp_vhd_reboot_startup;
+static bool dbp_persistence_init_failed;
 static bool dbp_optionsupdatecallback, dbp_reboot_set64mem, dbp_use_network, dbp_had_game_running, dbp_strict_mode, dbp_legacy_save, dbp_wasloaded, dbp_skip_c_mount;
 static signed char dbp_menu_time, dbp_conf_loading, dbp_reboot_machine;
 static Bit8u dbp_alphablend_base;
@@ -1259,6 +1261,16 @@ void DBP_ImgMountLoadDisks(char drive, const std::vector<std::string>& paths, bo
 	DBP_Mount(DBP_AppendImage(paths[0].c_str(), false));
 }
 
+bool DBPValidateStateMounts(const Bit32u saved[2])
+{
+	const char* fname;
+	Bit32u current[2] = { 0, 0 };
+	for (DBP_Image& image : dbp_images)
+		if (image.mounted && DBP_ExtractPathInfo(image.longpath.c_str(), &fname))
+			current[current[0] ? 1 : 0] = BaseStringToPointerHashMap::Hash(fname);
+	return current[0] == saved[0] && current[1] == saved[1];
+}
+
 void DBPSerialize_Mounts(DBPArchive& ar)
 {
 	const char* fname;
@@ -1268,6 +1280,13 @@ void DBPSerialize_Mounts(DBPArchive& ar)
 			if (i.mounted && DBP_ExtractPathInfo(i.longpath.c_str(), &fname))
 				mounthash[mounthash[0] ? 1 : 0] = BaseStringToPointerHashMap::Hash(fname);
 	ar << mounthash[0] << mounthash[1];
+	// VHD snapshots require the same mounted content before their commit. Avoid
+	// unmount/remount side effects (including synchronous disk publication).
+	if (ar.mode == DBPArchive::MODE_LOAD && ar.version >= 9)
+	{
+		if (!DBPValidateStateMounts(mounthash)) ar.had_error = DBPArchive::ERR_DISKSTATE;
+		return;
+	}
 	if (ar.mode == DBPArchive::MODE_LOAD && mounthash[0])
 		for (DBP_Image& i : dbp_images)
 			if (DBP_ExtractPathInfo(i.longpath.c_str(), &fname) && (mounthash[0] == BaseStringToPointerHashMap::Hash(fname) || (mounthash[1] && mounthash[1] == BaseStringToPointerHashMap::Hash(fname))))
@@ -1279,6 +1298,7 @@ static void DBP_Shutdown()
 	// to be called on the main thread
 	if (dbp_state == DBPSTATE_SHUTDOWN || dbp_state == DBPSTATE_BOOT) return;
 	DBP_ThreadControl(TCM_SHUTDOWN);
+	BIOS_FlushDifferencingVHDs();
 	if (!dbp_crash_message.empty())
 	{
 		retro_notify(0, RETRO_LOG_ERROR, "DOS crashed: %s", dbp_crash_message.c_str());
@@ -1298,6 +1318,9 @@ static void DBP_Shutdown()
 void DBP_OnBIOSReboot()
 {
 	// to be called on the DOSBox thread
+	BIOS_FlushDifferencingVHDs();
+	dbp_vhd_reboot_startup = BIOS_HasDifferencingVHDs();
+	if (BIOS_VHDTestEnabled("DBP_TEST_VHD_LIFECYCLE")) LOG_MSG("[DOSBOX] Milestone5 lifecycle test: BIOS reboot flush");
 	if ((MEM_TotalPages() / 256) == 64 && atoi(DBP_Option::Get(DBP_Option::memory_size)) < 32)
 		dbp_reboot_set64mem = true; // avoid another restart via DBP_Run::BootOS
 	dbp_biosreboot = true;
@@ -1307,6 +1330,9 @@ void DBP_OnBIOSReboot()
 void DBP_OnBIOSPoweroff()
 {
 	// to be called on the DOSBox thread
+	BIOS_FlushDifferencingVHDs();
+	dbp_vhd_reboot_startup = false;
+	if (BIOS_VHDTestEnabled("DBP_TEST_VHD_LIFECYCLE")) LOG_MSG("[DOSBOX] Milestone5 lifecycle test: BIOS poweroff flush");
 	dbp_biosreboot = true;
 	dbp_biospoweroff = true;
 	if (first_shell) DBP_DOSBOX_ForceShutdown();
@@ -2672,8 +2698,9 @@ static void init_dosbox_parse_drives()
 	}
 }
 
-static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::string* dbconf = NULL)
+static bool init_dosbox(bool forcemenu = false, bool reinit = false, const std::string* dbconf = NULL)
 {
+	dbp_persistence_init_failed = false;
 	if (reinit)
 	{
 		DBP_ASSERT(dbp_state == DBPSTATE_BOOT && control != NULL && !first_shell);
@@ -2713,7 +2740,9 @@ static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::
 		#endif
 	}
 	const int path_extlen = (path ? (int)((path_fragment ? path_fragment : path + dbp_content_path.length()) - path_ext) : 0);
-	const bool newcontent = !dbp_wasloaded, force_puremenu = forcemenu || (dbp_biosreboot && dbp_wasloaded);
+	// A BIOS reboot of an explicit standard child must re-run its startup
+	// mounting commands. Pure Menu's generic boot would mount the base image.
+	const bool newcontent = !dbp_wasloaded, force_puremenu = forcemenu || (dbp_biosreboot && dbp_wasloaded && !dbp_vhd_reboot_startup);
 	if (newcontent) dbp_biosreboot = dbp_reboot_set64mem = false; // ignore this when switching content
 	if (newcontent && !reinit) dbp_auto_mapping = NULL; // re-acquire when switching content
 
@@ -2760,6 +2789,22 @@ static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::
 			}
 			unionDrive* uni = new unionDrive(*union_underlay, (save_file.empty() ? NULL : &save_file[0]), true, dbp_strict_mode);
 			Drives['C'-'A'] = uni;
+			if (uni->HasPersistenceError())
+			{
+				// E_Exit/DBP_Crash require a running shell. No shell or emulation
+				// thread exists yet, so unwind initialization directly instead.
+				LOG_MSG("[DOSBOX] Persistence initialization failed; writable state was not loaded.");
+				retro_notify(0, RETRO_LOG_ERROR, "Persistence initialization failed; writable state was not loaded.");
+				delete control;
+				control = NULL;
+				dbp_state = DBPSTATE_SHUTDOWN;
+				dbp_frame_pending = dbp_refresh_memmaps = dbp_game_running = false;
+				dbp_persistence_init_failed = true;
+				if (!av_info.geometry.base_width) av_info.geometry = { 640, 480, 640, 480, 4.0f / 3.0f };
+				if (!av_info.timing.fps) av_info.timing = { 70.0, DBP_DEFAULT_SAMPLERATE };
+				environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+				return false;
+			}
 			mem_writeb(Real2Phys(dos.tables.mediaid) + ('C'-'A') * 9, uni->GetMediaByte());
 		}
 	}
@@ -2892,6 +2937,7 @@ static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::
 		if (!newcontent) dbp_image_index = (active_disk_image_index >= dbp_images.size() ? 0 : active_disk_image_index);
 	}
 	dbp_biosreboot = dbp_biospoweroff = dbp_reboot_set64mem = false;
+	dbp_vhd_reboot_startup = false;
 	dbp_wasloaded = true;
 	DBP_ReportCoreMemoryMaps();
 
@@ -2911,6 +2957,7 @@ static void init_dosbox(bool forcemenu = false, bool reinit = false, const std::
 	dbp_frame_pending = true;
 	dbp_state = DBPSTATE_FIRST_FRAME;
 	Thread::StartDetached(Local::ThreadDOSBox);
+	return true;
 }
 
 // This is called on the main thread
@@ -3367,13 +3414,12 @@ bool retro_load_game(const struct retro_game_info *info) //#4
 	dbp_memory_content_data = (info ? info->data : NULL);
 	dbp_memory_content_size = (info ? info->size : 0);
 	dbp_memory_content_path = (dbp_memory_content_data && dbp_memory_content_size ? dbp_content_path : std::string());
-	init_dosbox();
-
-	return true;
+	return init_dosbox();
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info) // #5
 {
+	if (dbp_persistence_init_failed) { *info = av_info; return; }
 	DBP_ASSERT(dbp_state != DBPSTATE_BOOT);
 	DBP_ThreadControl(TCM_FINISH_FRAME);
 	if (dbp_biosreboot || dbp_state == DBPSTATE_EXITED)
@@ -3381,6 +3427,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info) // #5
 		// A reboot can happen during the first frame if puremenu wants to change DOSBox machine config or if autoexec via dosbox.conf ran 'exit'
 		DBP_ASSERT(dbp_state == DBPSTATE_EXITED && (dbp_biosreboot || dbp_crash_message.size() || (control && !dbp_game_running)));
 		DBP_ForceReset();
+		if (dbp_persistence_init_failed) { *info = av_info; return; }
 		DBP_ThreadControl(TCM_FINISH_FRAME);
 		DBP_ASSERT((!dbp_biosreboot && dbp_state == DBPSTATE_FIRST_FRAME) || dbp_crash_message.size() || (control && !dbp_game_running));
 	}
@@ -3464,8 +3511,20 @@ void retro_run_touchpad(bool has_press, Bit16s absx, Bit16s absy)
 		{ DBP_QueueEvent(DBPET_MOUSEUP, DBP_NO_PORT, down_btn); down_tick = 0; }
 }
 
+static void DBP_TestVHDState();
+
+void DBP_PollPersistence()
+{
+	if (dbp_state != DBPSTATE_RUNNING && dbp_state != DBPSTATE_FIRST_FRAME) return;
+	DBP_ThreadControl(TCM_PAUSE_FRAME);
+	for (DOS_Drive* drive : Drives)
+		if (unionDrive* uni = (drive ? dynamic_cast<unionDrive*>(drive) : NULL)) uni->PollVhdCheckpoint();
+	// Remain paused; the next retro_run resumes through its normal frame path.
+}
+
 void retro_run(void)
 {
+	if (dbp_persistence_init_failed) return; // initialization already requested frontend shutdown
 	#ifdef DBP_ENABLE_FPS_COUNTERS
 	DBP_FPSCOUNT(dbp_fpscount_retro)
 	uint32_t curTick = DBP_GetTicks();
@@ -3585,7 +3644,10 @@ void retro_run(void)
 			if (!dbp_crash_message.empty()) // unexpected shutdown
 				DBP_Shutdown();
 			else if (dbp_state == DBPSTATE_REBOOT || dbp_biosreboot)
+			{
 				DBP_ForceReset();
+				if (dbp_persistence_init_failed) return;
+			}
 			else if (dbp_state == DBPSTATE_EXITED) // expected shutdown
 			{
 				#ifdef DBP_STANDALONE
@@ -3659,6 +3721,11 @@ void retro_run(void)
 
 	bool skip_emulate = (fpsboost > 1 && (((fpsboost_count++)%fpsboost)!=0)) || DBP_NeedFrameSkip(false);
 	DBP_ThreadControl(skip_emulate ? TCM_PAUSE_FRAME : TCM_FINISH_FRAME);
+	// The emulator is stopped here, including frontend pause frames. A host-time
+	// deadline cannot be postponed by continuous sector writes or stopped PIC time.
+	for (DOS_Drive* drive : Drives)
+		if (unionDrive* uni = (drive ? dynamic_cast<unionDrive*>(drive) : NULL)) uni->PollVhdCheckpoint();
+	DBP_TestVHDState();
 
 	Bit32u tpfActual = 0, tpfTarget = 0, tpfDraws = 0;
 	#ifdef DBP_ENABLE_WAITSTATS
@@ -3788,16 +3855,6 @@ static bool retro_serialize_all(DBPArchive& ar, bool unlock_thread)
 	if (dbp_serializemode == DBPSERIALIZE_DISABLED) return false;
 	bool pauseThread = (dbp_state != DBPSTATE_BOOT && dbp_state != DBPSTATE_SHUTDOWN);
 	if (pauseThread) DBP_ThreadControl(TCM_PAUSE_FRAME);
-	// Child disk generations are not part of save states yet. Reject state
-	// save/load and rewind instead of combining old machine state with new disk.
-	for (imageDisk* disk : imageDiskList)
-	{
-		if (!disk || !disk->HasDifferencingVHD()) continue;
-		if (pauseThread) DBP_ThreadControl(TCM_RESUME_FRAME);
-		if (ar.mode == DBPArchive::MODE_SAVE || ar.mode == DBPArchive::MODE_LOAD)
-			retro_notify(3000, RETRO_LOG_WARN, "Save states and rewind are unavailable with experimental differencing VHDs.");
-		return false;
-	}
 	DBPSerialize_All(ar, (dbp_state == DBPSTATE_RUNNING || dbp_state == DBPSTATE_FIRST_FRAME), dbp_game_running);
 	//log_cb(RETRO_LOG_WARN, "[SERIALIZE] [%d] [%s] %u\n", ((dbp_state == DBPSTATE_RUNNING || dbp_state == DBPSTATE_FIRST_FRAME) && dbp_game_running), (ar.mode == DBPArchive::MODE_LOAD ? "LOAD" : ar.mode == DBPArchive::MODE_SAVE ? "SAVE" : ar.mode == DBPArchive::MODE_SIZE ? "SIZE" : ar.mode == DBPArchive::MODE_MAXSIZE ? "MAXX" : ar.mode == DBPArchive::MODE_ZERO ? "ZERO" : "???????"), (Bit32u)ar.GetOffset());
 	if (dbp_game_running && ar.mode == DBPArchive::MODE_LOAD) dbp_lastmenuticks = DBP_GetTicks(); // force show menu on immediate emulation crash
@@ -3816,6 +3873,9 @@ static bool retro_serialize_all(DBPArchive& ar, bool unlock_thread)
 		{
 			case DBPArchive::ERR_LAYOUT:
 				retro_notify(0, RETRO_LOG_ERROR, "%s%s", "Load State Error: ", "Invalid file format");
+				break;
+			case DBPArchive::ERR_DISKSTATE:
+				retro_notify(0, RETRO_LOG_ERROR, "State disk snapshot is incompatible, failed, or exceeds the 512 MiB child limit; state was rejected.");
 				break;
 			case DBPArchive::ERR_VERSION:
 				retro_notify(0, RETRO_LOG_ERROR, "%sUnsupported version (%d)", "Load State Error: ", ar.version);
@@ -3859,9 +3919,16 @@ static bool retro_serialize_all(DBPArchive& ar, bool unlock_thread)
 
 size_t retro_serialize_size(void)
 {
-	if (dbp_serializesize) return dbp_serializesize;
+	if (dbp_serializesize && !BIOS_HasDifferencingVHDs()) return dbp_serializesize;
 	DBPArchiveCounter ar((dbp_state != DBPSTATE_RUNNING && dbp_state != DBPSTATE_FIRST_FRAME) || dbp_serializemode == DBPSERIALIZE_REWIND);
 	return dbp_serializesize = (retro_serialize_all(ar, false) ? ar.count : 0);
+}
+
+size_t DBP_MaxStateSize()
+{
+	DBPArchiveCounter ar(true);
+	if (!retro_serialize_all(ar, false)) return 0;
+	return ar.count + (BIOS_HasDifferencingVHDs() ? size_t(512) * 1024 * 1024 : 0);
 }
 
 bool retro_serialize(void *data, size_t size)
@@ -3876,9 +3943,247 @@ bool retro_unserialize(const void *data, size_t size)
 {
 	DBPArchiveReader ar(data, size);
 	bool res = retro_serialize_all(ar, true);
+	// A disk-bearing failed preflight must never become the upstream empty-
+	// rewind reset, which would run startup against the current disk timeline.
+	if (BIOS_HasDifferencingVHDs()) return res;
 	if ((ar.had_error != DBPArchive::ERR_DOSNOTRUNNING && ar.had_error != DBPArchive::ERR_GAMENOTRUNNING) || dbp_serializemode != DBPSERIALIZE_REWIND) return res;
 	if ((dbp_state != DBPSTATE_RUNNING && dbp_state != DBPSTATE_FIRST_FRAME) || dbp_game_running) retro_reset();
-	return true;
+	return !dbp_persistence_init_failed;
+}
+
+// Opt-in synthetic production-path exercise. The environment gate requires an
+// isolated Local AppData test root; ordinary packaged games never enter here.
+static void DBP_TestVHDState()
+{
+	static bool completed = false;
+	if (completed || !BIOS_VHDTestEnabled("DBP_TEST_VHD_STATE") || !dbp_game_running || !BIOS_HasDifferencingVHDs()) return;
+	completed = true;
+	DBP_ThreadControl(TCM_FINISH_FRAME); // public serializers may otherwise resume a skipped midframe
+	imageDisk* disk = NULL;
+	for (imageDisk* mounted : imageDiskList) if (mounted && mounted->HasDifferencingVHD()) { disk = mounted; break; }
+	if (!disk) return;
+	const DBP_SerializeMode saved_mode = dbp_serializemode;
+	const bool saved_delta = DBPArchive::accomodate_delta_encoding;
+	bool ok = true;
+	unsigned cases = 0;
+	Bit8u marker_a[512], marker_b[512], readback[512];
+	memset(marker_a, 0xA5, sizeof(marker_a)); memset(marker_b, 0x5A, sizeof(marker_b));
+	const char* test_mode = getenv("DBP_TEST_VHD_STATE");
+	if (!strcmp(test_mode, "fence"))
+	{
+		// Hash the already committed isolated save before the actual partial
+		// codec write, and again after the refused load and explicit flush.
+		const std::string path = DBP_GetSaveFile(SFT_GAMESAVE);
+		auto fingerprint = [&path](Bit64u& length, Bit64u& hash)
+		{
+			FILE* file = fopen_wrap(path.c_str(), "rb");
+			if (!file) return false;
+			length = 0; hash = UINT64_C(14695981039346656037);
+			Bit8u buffer[65536]; size_t bytes;
+			while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0)
+			{
+				length += bytes;
+				for (size_t i = 0; i < bytes; ++i) { hash ^= buffer[i]; hash *= UINT64_C(1099511628211); }
+			}
+			const bool read_ok = !ferror(file);
+			return !fclose(file) && read_ok && length;
+		};
+		dbp_serializemode = DBPSERIALIZE_STATES;
+		DBPArchive::accomodate_delta_encoding = false;
+		Bit64u before_length, before_hash, after_length, after_hash;
+		ok = fingerprint(before_length, before_hash);
+		const size_t size = retro_serialize_size();
+		std::vector<Bit8u> state(size);
+		ok = ok && size && retro_serialize(&state[0], size) && BIOS_VHDTestArmShortWrite(disk) &&
+			disk->Write_AbsoluteSector(5001, marker_b) && !retro_unserialize(&state[0], size) && !disk->FlushDifferencingVHD();
+		ok = ok && fingerprint(after_length, after_hash) && before_length == after_length && before_hash == after_hash;
+		LOG_MSG("[DOSBOX] Milestone5 state test: codec fault fences valid state restore and publication %s", (ok ? "PASS" : "FAIL"));
+		dbp_serializemode = saved_mode;
+		DBPArchive::accomodate_delta_encoding = saved_delta;
+		environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+		return;
+	}
+	if (!strcmp(test_mode, "write") || !strcmp(test_mode, "load"))
+	{
+		const std::string path = DBP_GetSaveFile(SFT_GAMESAVE) + ".milestone5.state";
+		std::string normalized_path(path), normalized_root(getenv("DBP_TEST_SAVE_ROOT"));
+		for (char& c : normalized_path) { if (c == '/') c = '\\'; if (c >= 'A' && c <= 'Z') c += 'a' - 'A'; }
+		for (char& c : normalized_root) { if (c == '/') c = '\\'; if (c >= 'A' && c <= 'Z') c += 'a' - 'A'; }
+		while (!normalized_root.empty() && normalized_root.back() == '\\') normalized_root.pop_back();
+		ok = !normalized_root.empty() && normalized_path.compare(0, normalized_root.size(), normalized_root) == 0 &&
+			normalized_path.size() > normalized_root.size() && normalized_path[normalized_root.size()] == '\\';
+		dbp_serializemode = DBPSERIALIZE_STATES;
+		DBPArchive::accomodate_delta_encoding = false;
+		if (ok && !strcmp(test_mode, "write"))
+		{
+			ok = !disk->Write_AbsoluteSector(5001, marker_a);
+			reg_eax = 0x4d355354;
+			const size_t size = retro_serialize_size();
+			std::vector<Bit8u> state(size);
+			ok = ok && size && retro_serialize(&state[0], size);
+			FILE* file = (ok ? fopen_wrap(path.c_str(), "wb") : NULL);
+			if (!file) ok = false;
+			else { ok = fwrite(&state[0], 1, size, file) == size && !fflush(file); if (fclose(file)) ok = false; }
+			ok = ok && !disk->Write_AbsoluteSector(5001, marker_b) && disk->FlushDifferencingVHD();
+			LOG_MSG("[DOSBOX] Milestone5 state test: restart capture %s", (ok ? "PASS" : "FAIL"));
+		}
+		else if (ok)
+		{
+			FILE* file = fopen_wrap(path.c_str(), "rb");
+			if (!file) ok = false;
+			else
+			{
+				fseek_wrap(file, 0, SEEK_END); const Bit64s size = ftell_wrap(file); fseek_wrap(file, 0, SEEK_SET);
+				ok = size > 0 && size <= 768 * 1024 * 1024;
+				std::vector<Bit8u> state(ok ? size_t(size) : 0);
+				if (ok) ok = fread(&state[0], 1, size_t(size), file) == size_t(size);
+				fclose(file);
+				if (ok) ok = !disk->Read_AbsoluteSector(5001, readback) && !memcmp(marker_b, readback, 512) &&
+					retro_unserialize(&state[0], size_t(size)) && !disk->Read_AbsoluteSector(5001, readback) &&
+					!memcmp(marker_a, readback, 512) && reg_eax == 0x4d355354 && disk->FlushDifferencingVHD();
+			}
+			LOG_MSG("[DOSBOX] Milestone5 state test: restart restore machine+disk %s", (ok ? "PASS" : "FAIL"));
+		}
+		dbp_serializemode = saved_mode;
+		DBPArchive::accomodate_delta_encoding = saved_delta;
+		environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+		return;
+	}
+	for (unsigned rewind = 0; rewind < 2 && ok; ++rewind)
+	{
+		dbp_serializemode = (rewind ? DBPSERIALIZE_REWIND : DBPSERIALIZE_STATES);
+		DBPArchive::accomodate_delta_encoding = !!rewind;
+		if (disk->Write_AbsoluteSector(5001, marker_a)) { ok = false; break; }
+		reg_eax = 0x4d355354;
+		const size_t size = retro_serialize_size();
+		std::vector<Bit8u> state(size);
+		if (!size || !retro_serialize(&state[0], size)) { ok = false; break; }
+		if (disk->Write_AbsoluteSector(5001, marker_b)) { ok = false; break; }
+		reg_eax = 0x13572468;
+		if (!retro_unserialize(&state[0], size) || disk->Read_AbsoluteSector(5001, readback) || memcmp(marker_a, readback, 512) || reg_eax != 0x4d355354)
+			{ ok = false; break; }
+		++cases;
+		LOG_MSG("[DOSBOX] Milestone5 state test: %s machine+disk restore PASS", (rewind ? "rewind" : "save/load"));
+
+		if (disk->Write_AbsoluteSector(5001, marker_b)) { ok = false; break; }
+		reg_eax = 0x24681357;
+		// These mutations exercise complete-envelope and disk preflight. Where
+		// needed, refresh the outer CRC so it cannot hide a disk validator bug.
+		for (unsigned test = 0; test < 16 && ok; ++test)
+		{
+			std::vector<Bit8u> bad(state);
+			size_t supplied_size = size;
+			if (test == 0) supplied_size = 20; // truncated envelope
+			else if (test == 1)
+			{
+				Bit64u payload_size; memcpy(&payload_size, &bad[9], 8);
+				bad[21 + size_t(payload_size) / 2] ^= 1; // exclude unused rewind capacity padding
+			}
+			else if (test == 2) bad[4] = 8; // older state has no disk snapshot
+			else if (test == 3) bad[6] ^= 1; // machine configuration preflight
+			else if (test == 14) bad[5] |= 1; // invalid DOS-running flag must reject without rewind reset
+			else if (test == 15) bad[5] |= 2; // invalid game-running flag must reject without rewind reset
+			else
+			{
+				const size_t payload = 21, generation_offset = payload + 2, length_offset = payload + 10;
+				if (test == 4) bad[payload + 40] ^= 1; // exact binding
+				else if (test == 5) bad[generation_offset] ^= 1; // generation/content disagreement
+				else if (test == 6) { Bit32u excessive = 512U*1024U*1024U + 1; memcpy(&bad[length_offset], &excessive, 4); }
+				else if (test == 7)
+				{
+					const size_t child_offset = payload + 1 + 1 + 8 + 4 + 26 + 512;
+					Bit32u child_length; memcpy(&child_length, &bad[length_offset], 4);
+					bad[child_offset] ^= 1; // leading VHD footer copy
+					Bit64u hash = UINT64_C(14695981039346656037);
+					for (size_t n = 0; n < child_length; ++n) { hash ^= bad[child_offset + n]; hash *= UINT64_C(1099511628211); }
+					memcpy(&bad[generation_offset], &hash, 8);
+				}
+				Bit64u payload_size; memcpy(&payload_size, &bad[9], 8);
+				if (test == 8)
+				{
+					// The final machine offset marker precedes the fixed directory.
+					const size_t directory_size = 64 * 24 + 8;
+					bad[payload + size_t(payload_size) - directory_size - sizeof(size_t)] ^= 1;
+				}
+				else if (test == 9) { payload_size -= 100; memcpy(&bad[9], &payload_size, 8); }
+				else if (test == 10)
+				{
+					const size_t directory_size = 64 * 24 + 8;
+					Bit64u machine_offset; memcpy(&machine_offset, &bad[payload + size_t(payload_size) - directory_size], 8);
+					bad[size_t(machine_offset)] ^= 1; // section digest preflight
+				}
+				else if (test == 11)
+				{
+					// Refresh both checksums around a semantic sparse-memory fault.
+					// It reaches the machine decoder, then must restore the private
+					// current-generation backup before returning the error.
+					const size_t directory = payload + size_t(payload_size) - (64 * 24 + 8);
+					Bit64u start, length; memcpy(&start, &bad[directory + 23 * 24], 8); memcpy(&length, &bad[directory + 23 * 24 + 8], 8);
+					const size_t sparse = size_t(start) + 3 * sizeof(Bitu) + 2;
+					Bit32u skip = 0xffffffffU, count = 4;
+					memcpy(&bad[sparse], &skip, 4); memcpy(&bad[sparse + 4], &count, 4);
+					Bit32u section_crc = DriveCalculateCRC32(&bad[size_t(start)], size_t(length));
+					memcpy(&bad[directory + 23 * 24 + 16], &section_crc, 4);
+				}
+				else if (test == 12)
+				{
+					const size_t directory = payload + size_t(payload_size) - (64 * 24 + 8);
+					Bit64u start, length; memcpy(&start, &bad[directory], 8); memcpy(&length, &bad[directory + 8], 8);
+					bad[size_t(start)] ^= 1;
+					Bit32u section_crc = DriveCalculateCRC32(&bad[size_t(start)], size_t(length));
+					memcpy(&bad[directory + 16], &section_crc, 4);
+				}
+				else if (test == 13)
+				{
+					struct TestSection { Bit64u start, length; Bit32u crc, reserved; } sections[64];
+					const size_t old_directory = payload + size_t(payload_size) - (64 * 24 + 8);
+					memcpy(sections, &bad[old_directory], sizeof(sections));
+					std::vector<Bit8u> file;
+					auto append = [&file](const void* data, size_t bytes) { const Bit8u* p = (const Bit8u*)data; file.insert(file.end(), p, p + bytes); };
+					Bit8u count = 1, index = 0, drive = 2, name_len = 8; Bit32u flags = OPEN_READWRITE, refs = 1, position = 0; Bit16u attr = DOS_ATTR_ARCHIVE, date = 0, time = 0; bool pending_time = false;
+					append(&count, 1); append(&index, 1); append(&drive, 1); append(&name_len, 1); append(&flags, 4); append(&attr, 2); append(&refs, 4); append(&position, 4); append(&date, 2); append(&time, 2); append(&pending_time, 1); append("NOM5.TMP", 8);
+					const size_t start = size_t(sections[30].start), old_length = size_t(sections[30].length);
+					const ptrdiff_t delta = ptrdiff_t(file.size()) - ptrdiff_t(old_length);
+					bad.erase(bad.begin() + start, bad.begin() + start + old_length);
+					bad.insert(bad.begin() + start, file.begin(), file.end());
+					payload_size = Bit64u(ptrdiff_t(payload_size) + delta); memcpy(&bad[9], &payload_size, 8);
+					const size_t directory = payload + size_t(payload_size) - (64 * 24 + 8);
+					Bit32u count_sections; memcpy(&count_sections, &bad[payload + size_t(payload_size) - 4], 4);
+					for (unsigned n = 30; n < count_sections; ++n)
+					{
+						if (n == 30) sections[n].length = file.size(); else sections[n].start = Bit64u(ptrdiff_t(sections[n].start) + delta);
+						const size_t end = size_t(sections[n].start + sections[n].length);
+						memcpy(&bad[end], &end, sizeof(end));
+						sections[n].crc = DriveCalculateCRC32(&bad[size_t(sections[n].start)], size_t(sections[n].length));
+					}
+					memcpy(&bad[directory], sections, sizeof(sections));
+				}
+				Bit32u crc = DriveCalculateCRC32(&bad[payload], size_t(payload_size));
+				memcpy(&bad[17], &crc, 4);
+			}
+			if (test == 13) supplied_size = bad.size();
+			if (retro_unserialize(&bad[0], supplied_size) || disk->Read_AbsoluteSector(5001, readback) || memcmp(marker_b, readback, 512) || reg_eax != 0x24681357 ||
+				(test == 13 && Drives[2] && Drives[2]->FileExists("NOM5.TMP")))
+				{ LOG_MSG("[DOSBOX] Milestone5 state test: negative case %u FAIL (%s)", test, (rewind ? "rewind" : "save/load")); ok = false; break; }
+			++cases;
+		}
+		if (ok) LOG_MSG("[DOSBOX] Milestone5 state test: malformed/binding/generation/cap/codec/machine-layout/mount/file preflight and decoder rollback PASS (%s)", (rewind ? "rewind" : "save/load"));
+		if (!rewind && ok)
+		{
+			// Allocate a fresh child block after the frontend queried state size.
+			if (disk->Write_AbsoluteSector(12000, marker_b)) { ok = false; break; }
+			std::vector<Bit8u> undersized(size);
+			if (retro_serialize(&undersized[0], size) || retro_serialize_size() <= size || !retro_unserialize(&state[0], size)) { ok = false; break; }
+			++cases;
+			LOG_MSG("[DOSBOX] Milestone5 state test: growth buffer refusal and codec shrink reopen PASS");
+		}
+	}
+	dbp_serializemode = saved_mode;
+	DBPArchive::accomodate_delta_encoding = saved_delta;
+	if (ok && !disk->FlushDifferencingVHD()) ok = false;
+	LOG_MSG("[DOSBOX] Milestone5 state test: %s (%u production cases); resumed publication %s", (ok ? "PASS" : "FAIL"), cases, (ok ? "PASS" : "FAIL"));
+	// The synthetic process may now close normally and release its writer lock.
+	environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
 }
 
 void retro_deinit(void)

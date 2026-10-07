@@ -26,6 +26,13 @@
 #include <vector>
 #include <climits>
 #include <utility>
+#include "save_transaction.h"
+#if defined(DBP_STANDALONE) && defined(C_DBP_SUPPORT_DISK_MOUNT_DOSFILE)
+#include "../ints/vhd_dos_source.h"
+#include "../ints/vhd_identity.h"
+extern const DBPVHD::Identity* DBPS_GetPackageVhdIdentity();
+extern bool DBPS_HashVhdSource(DBPVHD::Source& source, unsigned char digest[32]);
+#endif
 
 static std::string VhdBindingName(const char* child)
 {
@@ -120,20 +127,32 @@ public:
 		mods += '\n';
 	}
 
-	static bool Deserialize(const char*& p, StringToPointerHashMap<Union_Modification>& modifications)
+	static bool Deserialize(const char*& p, StringToPointerHashMap<Union_Modification>& modifications, bool* valid = NULL)
 	{
 		if (!*p) return false;
 		const char* nlptr = strchr(p, '\n'), *nl = (nlptr ? nlptr : p + strlen(p));
 		while (nl > p && nl[-1] <= ' ') nl--;
 
 		Type t = TNONE;
-		if      (nl - p > sizeof("REDIRECTDIR|" ) && !memcmp(p, "REDIRECTDIR|",  sizeof("REDIRECTDIR|" )-1)) { t = TDIR;    p += sizeof("REDIRECTDIR|" )-1; }
-		else if (nl - p > sizeof("REDIRECTFILE|") && !memcmp(p, "REDIRECTFILE|", sizeof("REDIRECTFILE|")-1)) { t = TFILE;   p += sizeof("REDIRECTFILE|")-1; }
-		else if (nl - p > sizeof("DELETE|"      ) && !memcmp(p, "DELETE|",       sizeof("DELETE|"      )-1)) { t = TDELETE; p += sizeof("DELETE|"      )-1; }
-		const char* split = (t == TDIR || t == TFILE ? strchr(p, '|') : NULL);
-		if (t != TNONE && (!split || split + 1 < nl))
+		if      (nl - p >= sizeof("REDIRECTDIR|" ) && !memcmp(p, "REDIRECTDIR|",  sizeof("REDIRECTDIR|" )-1)) { t = TDIR;    p += sizeof("REDIRECTDIR|" )-1; }
+		else if (nl - p >= sizeof("REDIRECTFILE|") && !memcmp(p, "REDIRECTFILE|", sizeof("REDIRECTFILE|")-1)) { t = TFILE;   p += sizeof("REDIRECTFILE|")-1; }
+		else if (nl - p >= sizeof("DELETE|"      ) && !memcmp(p, "DELETE|",       sizeof("DELETE|"      )-1)) { t = TDELETE; p += sizeof("DELETE|"      )-1; }
+		const bool redirect = (t == TDIR || t == TFILE);
+		const char* split = (redirect ? (const char*)memchr(p, '|', nl - p) : NULL);
+		if (t != TNONE && (!redirect || (split && split + 1 < nl)))
 		{
 			size_t target_len = (split ? split : nl) - p, source_len = (split ? nl - (split + 1) : 0);
+			std::string target_path(p, target_len), source_path(split ? split + 1 : p, source_len);
+			for (size_t i = 0; i < target_path.size(); ++i) if (target_path[i] == '\\') target_path[i] = '/';
+			for (size_t i = 0; i < source_path.size(); ++i) if (source_path[i] == '\\') source_path[i] = '/';
+			if (target_len > DOS_PATHLENGTH || source_len > DOS_PATHLENGTH || target_path.find('|') != std::string::npos || source_path.find('|') != std::string::npos ||
+				!DBPSave::SafeName(target_path) || (source_len && !DBPSave::SafeName(source_path)))
+			{
+				if (valid) *valid = false;
+				while (*nl && *nl <= ' ') nl++;
+				p = nl;
+				return *p != '\0';
+			}
 			Union_Modification* m = new Union_Modification();
 			m->type = t;
 			memcpy(m->target, p, target_len);
@@ -142,8 +161,14 @@ public:
 			m->target_lastslash = (Bit8u)(target_lastslash ? (target_lastslash - m->target) : 0);
 			if (split) memcpy(m->source, split+1, source_len);
 			m->source[source_len] = '\0';
+			if (Union_Modification* existing = modifications.Get(m->target))
+			{
+				if (valid) *valid = false;
+				delete existing;
+			}
 			modifications.Put(m->target, m);
 		}
+		else if (valid) *valid = false;
 		while (*nl && *nl <= ' ') nl++;
 		return (*(p = nl) != '\0');
 	}
@@ -159,6 +184,9 @@ struct unionDriveImpl
 	std::vector<Bit32u> dirty_paths;
 	std::vector<std::pair<std::string, std::string> > vhd_leases;
 	std::string save_file;
+	DBPSave::Transaction transaction;
+	uint64_t save_deadline = 0;
+	bool save_event_pending = false, persistence_error = false;
 	Bit32u save_size, free_bytes;
 	bool writable, autodelete_under, autodelete_over, dirty;
 	Bit16u modification_date, modification_time;
@@ -191,7 +219,23 @@ struct unionDriveImpl
 		{
 			DBP_ASSERT(!_over && writable);
 			save_file = _save_file;
-			ReadSaveFile(strict_mode);
+			bool recovered = false;
+			if (!transaction.Acquire(save_file, ValidateSave, ValidateRecovery, this))
+			{
+				persistence_error = true;
+				LOG_MSG("[DOSBOX] Persistence error: save overlay is already in use or its writer lock cannot be opened: %s", save_file.c_str());
+			}
+			else if (!transaction.Recover(recovered))
+			{
+				persistence_error = true;
+				LOG_MSG("[DOSBOX] Persistence error: no complete recoverable save generation: %s", save_file.c_str());
+			}
+			if (persistence_error) writable = false;
+			else
+			{
+				if (recovered) LOG_MSG("[DOSBOX] Recovered complete save generation: %s", save_file.c_str());
+				ReadSaveFile(strict_mode);
+			}
 		}
 	}
 
@@ -286,6 +330,32 @@ struct unionDriveImpl
 		modification_date = (t ? DOS_PackDate((Bit16u)(t->tm_year+1900),(Bit16u)(t->tm_mon+1),(Bit16u)t->tm_mday) : 0);
 	}
 
+	static bool ReadSaveEntry(DOS_File* file, std::string& out, Bit32u maximum)
+	{
+		if (!file) return false;
+		if (!file->refCtr) file->AddRef();
+		Bit64u size = 0, position = 0;
+		bool ok = !maximum || (file->Seek64(&size, DOS_SEEK_END) && size <= maximum && file->Seek64(&position, DOS_SEEK_SET) && !position);
+		if (maximum && ok)
+		{
+			size_t offset = out.size();
+			if (size > SIZE_MAX - offset) ok = false;
+			else
+			{
+				out.resize(offset + (size_t)size);
+				while (size)
+				{
+					Bit16u count = (Bit16u)(size < 65535 ? size : 65535), expected = count;
+					if (!file->Read((Bit8u*)&out[offset], &count) || count != expected) { ok = false; break; }
+					offset += count; size -= count;
+				}
+			}
+		}
+		if (!file->Close()) ok = false;
+		delete file;
+		return ok;
+	}
+
 	void ReadSaveFile(bool strict_mode)
 	{
 		struct Loader
@@ -293,6 +363,7 @@ struct unionDriveImpl
 			zipDrive* zip;
 			unionDriveImpl* impl;
 			bool strict_mode;
+			bool failed = false;
 			Loader(zipDrive* _zip, unionDriveImpl* _impl, bool _strict_mode) : zip(_zip), impl(_impl), strict_mode(_strict_mode) {}
 			static void LoadFiles(const char* path, bool is_dir, Bit32u size, Bit16u date, Bit16u time, Bit8u attr, Bitu data)
 			{
@@ -302,18 +373,23 @@ struct unionDriveImpl
 				{
 					df->AddRef();
 					std::vector<char> mods;
-					mods.resize(size+sizeof('\0'));
+					if (size > 16 * 1024 * 1024) { l.failed = true; df->Close(); delete df; return; }
+					mods.resize((size_t)size+sizeof('\0'));
 					Bit8u* buf = (Bit8u*)&mods[0];
 					for (Bit16u read; size; size -= read, buf += read)
 					{
 						read = (Bit16u)(size > 0xFFFF ? 0xFFFF : size);
-						if (!df->Read(buf, &read)) { DBP_ASSERT(0); }
+						const Bit16u expected = read;
+						if (!df->Read(buf, &read) || read != expected) { l.failed = true; break; }
 					}
 					df->Close();
 					delete df;
+					if (l.failed) return;
 
 					const char* ptr = &mods[0];
-					while (Union_Modification::Deserialize(ptr, l.impl->modifications)) {}
+					bool valid = true;
+					while (Union_Modification::Deserialize(ptr, l.impl->modifications, &valid)) {}
+					if (!valid) { l.failed = true; return; }
 					l.impl->modification_date = date;
 					l.impl->modification_time = time;
 					return;
@@ -325,16 +401,22 @@ struct unionDriveImpl
 					if (ext && (!memcmp(ext, ".EXE", 4) || !memcmp(ext, ".COM", 4) || !memcmp(ext, ".BAT", 4) || !strcmp(path, "DOS.YML"))) return;
 				}
 				CreateParentDirs(*l.impl->save_mem, path);
-				if (!l.impl->save_mem->CloneEntry(l.zip, path)) { DBP_ASSERT(0); }
+				if (!l.impl->save_mem->CloneEntry(l.zip, path)) { l.failed = true; return; }
 				l.impl->save_size += size;
 			}
 		};
 		FILE* zip_file_h = fopen_wrap(save_file.c_str(), "rb");
 		if (!zip_file_h) return;
 
-		Loader l(new zipDrive(new rawFile(zip_file_h, false)), this, strict_mode);
+		Loader l(new zipDrive(new rawFile(zip_file_h, false), true), this, strict_mode);
 		const Bit16u save_errorcode = dos.errorcode;
 		DriveFileIterator(l.zip, Loader::LoadFiles, (Bitu)&l);
+		if (l.failed)
+		{
+			persistence_error = true;
+			writable = false;
+			LOG_MSG("[DOSBOX] Persistence error: failed to load complete save generation: %s", save_file.c_str());
+		}
 
 		// Forget delete modifications that have been re-added as files/directories to the save ZIP
 		for (Union_Modification* m : modifications)
@@ -347,6 +429,103 @@ struct unionDriveImpl
 
 		dos.errorcode = save_errorcode;
 		delete l.zip; // calls fclose
+	}
+
+	static bool VerifyDeflated(const std::string& archive, const std::string& name, uint32_t size, uint32_t expected_crc)
+	{
+		FILE* host = fopen_wrap(archive.c_str(), "rb");
+		if (!host) return false;
+		zipDrive zip(new rawFile(host, false), true);
+		std::string path = name;
+		for (size_t n = 0; n < path.size(); ++n) if (path[n] == '/') path[n] = '\\';
+		DOS_File* file = NULL;
+		if (!zip.FileOpen(&file, (char*)path.c_str(), OPEN_READ)) return false;
+		file->AddRef();
+		bool ok = true;
+		Bit8u buffer[65535];
+		Bit32u remaining = size, crc = 0;
+		while (remaining)
+		{
+			Bit16u count = (Bit16u)(remaining < sizeof(buffer) ? remaining : sizeof(buffer)), expected = count;
+			if (!file->Read(buffer, &count) || count != expected) { ok = false; break; }
+			crc = DriveCalculateCRC32(buffer, count, crc); remaining -= count;
+		}
+		file->Close(); delete file;
+		return ok && crc == expected_crc;
+	}
+	static bool ValidateSave(const std::string& path)
+	{
+		if (!DBPSave::Validate(path, VerifyDeflated)) return false;
+		FILE* host = fopen_wrap(path.c_str(), "rb");
+		if (!host) return false;
+		zipDrive zip(new rawFile(host, false), true);
+		DOS_File* file = NULL;
+		if (!zip.FileExists("FILEMODS.DBP")) return true;
+		if (!zip.FileOpen(&file, (char*)"FILEMODS.DBP", OPEN_READ)) return false;
+		std::string bytes;
+		if (!ReadSaveEntry(file, bytes, 16 * 1024 * 1024)) return false;
+		if (bytes.find('\0') != std::string::npos) return false;
+		const char* ptr = bytes.c_str();
+		StringToPointerHashMap<Union_Modification> mods;
+		bool valid = true;
+		while (Union_Modification::Deserialize(ptr, mods, &valid)) {}
+		for (Union_Modification* mod : mods) delete mod;
+		return valid;
+	}
+
+	static bool ValidateRecovery(const std::string& path, void* context)
+	{
+		#if defined(DBP_STANDALONE) && defined(C_DBP_SUPPORT_DISK_MOUNT_DOSFILE)
+		const DBPVHD::Identity* identity = DBPS_GetPackageVhdIdentity();
+		if (!identity) return true;
+		unionDriveImpl* impl = (unionDriveImpl*)context;
+		FILE* host = fopen_wrap(path.c_str(), "rb");
+		if (!host) return false;
+		zipDrive zip(new rawFile(host, false), true);
+		if (zip.FileExists(identity->parent.c_str())) return false;
+		struct Handle
+		{
+			DOS_File* file = NULL;
+			~Handle() { if (file) { file->Close(); delete file; } }
+			bool Open(DOS_Drive* drive, const std::string& name)
+			{
+				if (!drive->FileOpen(&file, (char*)name.c_str(), OPEN_READ)) return false;
+				file->AddRef(); return true;
+			}
+		} parent_file, child_file, binding_file;
+		if (!parent_file.Open(impl->under, identity->parent) || !child_file.Open(&zip, identity->child) || !binding_file.Open(&zip, VhdBindingName(identity->child.c_str()))) return false;
+		Bit64u binding_size = 0;
+		if (!binding_file.file->Seek64(&binding_size, DOS_SEEK_END) || binding_size != 512) return false;
+		binding_size = 0;
+		Bit16u count = 512;
+		Bit8u binding[512];
+		if (!binding_file.file->Seek64(&binding_size, DOS_SEEK_SET) || !binding_file.file->Read(binding, &count) || count != 512) return false;
+		VhdDOSSource<DOS_File> parent_source, child_source;
+		if (!parent_source.Open(parent_file.file, false) || !child_source.Open(child_file.file, false)) return false;
+		Bit8u digest[32];
+		if (!DBPS_HashVhdSource(parent_source, digest) || memcmp(digest, identity->sha256, 32)) return false;
+		DBPVHD::Parent parent;
+		DBPVHD::Child child;
+		return parent.Open(parent_source, DBPVHD::Detail::BE32(binding + DBPVHD::Identity::TimestampOffset)) &&
+			parent.SectorCount() * 512 == identity->virtualSize && !memcmp(parent.UniqueId(), identity->parentUuid, 16) &&
+			child.Open(child_source, parent) && identity->Matches(binding, child.UniqueId());
+		#else
+		(void)path; (void)context;
+		return true;
+		#endif
+	}
+
+	void ReportSaveError()
+	{
+		LOG_MSG("[DOSBOX] Error while writing game save file '%s'; previous generation retained", save_file.c_str());
+		static int reportcount;
+		if (reportcount++ < 3 || !(reportcount % 6))
+		{
+			extern void emuthread_notify(int duration, LOG_SEVERITIES lvl, char const* format,...);
+			emuthread_notify(2000, LOG_ERROR, "Error while writing game save file '%s'!", save_file.c_str());
+		}
+		save_event_pending = false;
+		ScheduleSave(NULL, 5000.f);
 	}
 
 	static void WriteSaveFile(Bitu implPtr)
@@ -375,29 +554,21 @@ struct unionDriveImpl
 		}};
 
 		unionDriveImpl* impl = (unionDriveImpl*)implPtr;
+		PIC_RemoveSpecificEvents(WriteSaveFile, implPtr);
+		impl->save_event_pending = false;
 		// A failed VHD operation may have left partial bytes in memory. Keep the
 		// last on-disk generation intact; never publish those bytes on shutdown.
-		if (impl->vhd_save_failed) return;
+		if (impl->vhd_save_failed || impl->persistence_error || impl->save_file.empty() || !impl->dirty) return;
 		LOG_MSG("[DOSBOX] Saving filesystem modifications to %s", impl->save_file.c_str());
-		FILE* fsave = fopen_wrap(impl->save_file.c_str(), "rb+");
-		bool matches_existing = !!fsave, need_truncate = matches_existing;
-		if (!fsave) fsave = fopen_wrap(impl->save_file.c_str(), "wb");
+		FILE* fsave = impl->transaction.Begin();
 		if (!fsave)
 		{
-			LOG_MSG("[DOSBOX] Opening file %s for writing failed", impl->save_file.c_str());
-			reporterror:
-			static int reportcount;
-			if (reportcount++ < 3 || !(reportcount % 6))
-			{
-				extern void emuthread_notify(int duration, LOG_SEVERITIES lvl, char const* format,...);
-				emuthread_notify(2000, LOG_ERROR, "Error while writing game save file '%s'!", impl->save_file.c_str());
-			}
-			impl->ScheduleSave(NULL, 5000.f);
+			impl->ReportSaveError();
 			return;
 		}
 
-		// Sort files by age so oldest files (which don't change anymore) are at the front of the save file.
-		// This is so most of the save file can be kept as is when updating a (potentially large) existing save.
+		// Retain the existing ZIP entry ordering and selection; publish a complete
+		// replacement generation rather than modifying the committed ZIP in place.
 		std::vector<SaveFile> save_files;
 		DOS_Drive *over = impl->over, *under = impl->under;
 		DriveFileIterator(over, Local::QueueFile, (Bitu)&save_files);
@@ -433,14 +604,14 @@ struct unionDriveImpl
 				df->AddRef();
 				df->Seek(&under_size, DOS_SEEK_END);
 				under_match_size = (under_size == size);
-				ReadAndClose(df, sbuf, (under_match_size ? size : 0));
+				if (!ReadSaveEntry(df, sbuf, (under_match_size ? size : 0))) { failed = true; break; }
 			}
 
 			if (under_match_size || is_swap)
 			{
-				const bool fullyread = over->FileOpen(&df, (char*)path, 0) && ReadAndClose(df, sbuf, size);
-				DBP_ASSERT(fullyread && sbuf.size() == (size_t)size * (under_match_size ? 2 : 1));
-				filedata = (Bit8u*)&sbuf[under_match_size ? size : 0];
+				const bool fullyread = over->FileOpen(&df, (char*)path, 0) && ReadSaveEntry(df, sbuf, size);
+				if (!fullyread || sbuf.size() != (size_t)size * (under_match_size ? 2 : 1)) { failed = true; break; }
+				filedata = size ? (Bit8u*)&sbuf[under_match_size ? size : 0] : NULL;
 
 				// If content matches, don't store in save file
 				if (under_match_size && (!size || !memcmp(filedata, &sbuf[0], size))) continue;
@@ -448,6 +619,7 @@ struct unionDriveImpl
 				// Don't write files with .SWP ending that are either empty or filled with zero bytes (temporary swap files)
 				if (is_swap)
 				{
+					if (!size) continue;
 					bool allzeros = true;
 					for (const Bit8u *p = filedata, *pEnd = p + size; p != pEnd; p++) { if (*p) { allzeros = false; break; } }
 					if (allzeros) continue;
@@ -459,6 +631,8 @@ struct unionDriveImpl
 			}
 
 			// Generate local file header
+			if (file_count == 65535 || (uint64_t)local_file_offset + 30 + pathLen + size + central_dir.size() + 46 + pathLen + 22 > UINT32_MAX)
+				{ failed = true; break; }
 			Bit8u lfh[30 + DOS_PATHLENGTH + 8];
 			const Bit16u date = (Bit16u)(sf.datetime >> 16), time = (Bit16u)sf.datetime;
 			ZIP_WRITE_LE32(lfh+ 0, 0x04034b50); // Local file header signature
@@ -479,51 +653,17 @@ struct unionDriveImpl
 			if (sf.is_dir)
 				lfh[lfhlen - 1] = '/';
 
-			// Check if the file was modified since last save and if so force writing
-			if (matches_existing && impl->dirty_paths.size())
+			if (!sf.is_dir && !filedata)
 			{
-				const Bit32u namecrc = DriveCalculateCRC32((const Bit8u*)path, pathLen);
-				for (std::vector<Bit32u>::iterator it = impl->dirty_paths.begin(); it != impl->dirty_paths.end(); ++it)
-				{
-					if (namecrc != *it) continue;
-					// When switching a stream opened with rb+ from reading to writing, an intervening call to a file-positioning function must be used (i.e. fseek)
-					fseek(fsave, 0, SEEK_CUR);
-					matches_existing = false;
-					impl->dirty_paths.erase(it);
-					break;
-				}
+				const bool fullyread = over->FileOpen(&df, (char*)path, 0) && ReadSaveEntry(df, sbuf, size);
+				if (!fullyread || sbuf.size() != size) { failed = true; break; }
+				filedata = size ? (const Bit8u*)&sbuf[0] : NULL;
 			}
-
-			// Check if the file already exists at this position, and skip writing it if so
-			if (matches_existing)
-			{
-				Bit8u matchlfh[sizeof(lfh)];
-				matches_existing = (fread(matchlfh, lfhlen, 1, fsave) == 1);
-				memcpy(lfh+14, matchlfh+14, 4); // Use existing CRC-32 (skip need to calculate it)
-				matches_existing &= !memcmp(lfh, matchlfh, lfhlen); // compare local file header
-				if (!matches_existing)
-					fseek(fsave, local_file_offset, SEEK_SET); // mismatch, seek back before lfh
-				else if (size)
-					fseek(fsave, (int)size, SEEK_CUR); // still matching, seek past data to next file
-				// We could do additional checks like confirming the first few and last few bytes of the file or even the CRC
-				// but for now we keep things fast under the assumption that the save ZIP has not been tampered with
-			}
-
-			if (!matches_existing)
-			{
-				if (!sf.is_dir && !filedata)
-				{
-					const bool fullyread = over->FileOpen(&df, (char*)path, 0) && ReadAndClose(df, sbuf, size);
-					DBP_ASSERT(fullyread && sbuf.length() == (size_t)size);
-					filedata = (Bit8u*)&sbuf[0];
-				}
-
-				const Bit32u crc32 = (size ? DriveCalculateCRC32(filedata, size) : 0);
-				ZIP_WRITE_LE32(lfh+14, crc32); // CRC-32 of uncompressed data
-
-				// Write local file header followed by file data
-				failed |= !(fwrite(lfh, lfhlen, 1, fsave) && (!size || fwrite(filedata, size, 1, fsave)));
-			}
+			const Bit32u crc32 = (size ? DriveCalculateCRC32(filedata, size) : 0);
+			ZIP_WRITE_LE32(lfh+14, crc32);
+			failed |= !DBPSave::Write(fsave, lfh, lfhlen, impl->save_file);
+			if (size) failed |= !DBPSave::Write(fsave, filedata, size, impl->save_file);
+			if (failed) break;
 
 			// Generate central directory file header
 			const size_t centralDirPos = central_dir.size();
@@ -555,24 +695,13 @@ struct unionDriveImpl
 		ZIP_WRITE_LE32(eocd+16, local_file_offset);          // Offset of start of central directory, relative to start of archive
 		ZIP_WRITE_LE16(eocd+20, 0);                          // Comment length (n)
 
-		// Check if all that remains is the central directory in the existing save file
-		if (matches_existing)
+		if (!failed)
 		{
-			Bit32u match_len = (file_count ? 46 : 22); //either compare CD or end of CD
-			Bit8u matchbuf[46];
-			matches_existing = fread(matchbuf, match_len, 1, fsave) && !memcmp((file_count ? &central_dir[0] : eocd), matchbuf, match_len);
-			if (!matches_existing) fseek(fsave, local_file_offset, SEEK_SET);
+			if (file_count) failed |= !DBPSave::Write(fsave, &central_dir[0], central_dir.size(), impl->save_file);
+			failed |= !DBPSave::Write(fsave, eocd, sizeof(eocd), impl->save_file);
 		}
+		if (!impl->transaction.Finish(fsave, !failed)) { impl->ReportSaveError(); return; }
 
-		if (!matches_existing)
-		{
-			failed |= !((!file_count || fwrite(&central_dir[0], central_dir.size(), 1, fsave)) && fwrite(eocd, 22, 1, fsave));
-			if (need_truncate)
-				failed |= !!ftruncate(fileno(fsave), (local_file_offset + (Bit32u)central_dir.size() + 22));
-		}
-		fclose(fsave);
-
-		if (failed) { LOG_MSG("[DOSBOX] Error while writing file %s", impl->save_file.c_str()); goto reporterror; }
 		impl->save_size = save_size;
 		impl->dirty = false;
 		impl->dirty_paths.clear();
@@ -580,12 +709,13 @@ struct unionDriveImpl
 
 	void ScheduleSave(const char* path = NULL, float delay_ms = 0)
 	{
-		if (save_file.empty() || vhd_save_failed) return;
+		if (save_file.empty() || vhd_save_failed || persistence_error) return;
 		if (!delay_ms)
 		{
 			// The larger the save data, the bigger the delay until we write it to disk (1 up to 60 seconds)
 			delay_ms = 1000.f + 1000.f * (save_size / (float)(1024 * 1024));
 			if (delay_ms > 60000.f) delay_ms = 60000.f;
+			if (!vhd_leases.empty() && delay_ms > 5000.f) delay_ms = 5000.f;
 		}
 		if (path)
 		{
@@ -594,9 +724,24 @@ struct unionDriveImpl
 			dirty_paths.push_back(namecrc);
 			alreadydirty:;
 		}
+		dirty = true;
+		if (save_event_pending)
+		{
+			// A normal overlay write may have queued a longer delay before a
+			// child was mounted. Bound that existing deadline without extending it.
+			const uint64_t child_deadline = DBPSave::ClockMs() + 5000;
+			if (!vhd_leases.empty() && save_deadline > child_deadline)
+			{
+				save_deadline = child_deadline;
+				PIC_RemoveSpecificEvents(WriteSaveFile, (Bitu)this);
+				PIC_AddEvent(WriteSaveFile, 5000.f, (Bitu)this);
+			}
+			return; // later writes must not move first-dirty deadline
+		}
+		save_deadline = DBPSave::ClockMs() + (uint64_t)delay_ms;
 		PIC_RemoveSpecificEvents(WriteSaveFile, (Bitu)this);
 		PIC_AddEvent(WriteSaveFile, delay_ms, (Bitu)this);
-		dirty = true;
+		save_event_pending = true;
 	}
 
 	void ForceCloseFileAndScheduleSave(DOS_Drive* drv, const char* path, bool isFile)
@@ -1222,10 +1367,38 @@ bool unionDrive::AcquireVhdFiles(const char* parent, const char* child, DOS_File
 	(*child_file)->AddRef();
 	created = !exists;
 	impl->vhd_leases.push_back(std::make_pair(std::string(parent), std::string(child)));
+	if (impl->dirty) impl->ScheduleSave();
 	return true;
 }
 
 void unionDrive::VhdChanged(const char* child) { impl->ScheduleSave(child); }
+
+bool unionDrive::FlushVhd()
+{
+	if (impl->vhd_save_failed || impl->persistence_error) return false;
+	if (impl->dirty) unionDriveImpl::WriteSaveFile((Bitu)impl);
+	return !impl->dirty;
+}
+
+void unionDrive::PollVhdCheckpoint()
+{
+	if (impl->dirty && impl->save_event_pending && DBPSave::ClockMs() >= impl->save_deadline)
+		unionDriveImpl::WriteSaveFile((Bitu)impl);
+}
+
+bool unionDrive::HasPersistenceError() { return impl->persistence_error; }
+
+void unionDrive::RebaseVhdCheckpoint()
+{
+	PIC_RemoveSpecificEvents(unionDriveImpl::WriteSaveFile, (Bitu)impl);
+	impl->save_event_pending = false;
+	impl->ScheduleSave();
+}
+
+bool unionDrive::SwapVhdChild(const char* child, std::vector<Bit8u>& bytes)
+{
+	return impl->save_mem && !impl->vhd_save_failed && !impl->persistence_error && impl->VhdLocked(child) && impl->save_mem->SwapFileContents(child, bytes);
+}
 
 bool unionDrive::ReadVhdBinding(const char* child, Bit8u data[512], bool& exists)
 {
@@ -1265,6 +1438,7 @@ void unionDrive::VhdFailed(const char* error)
 {
 	if (impl->vhd_save_failed) return;
 	impl->vhd_save_failed = true;
+	impl->save_event_pending = false;
 	PIC_RemoveSpecificEvents(unionDriveImpl::WriteSaveFile, (Bitu)impl);
 	LOG_MSG("[DOSBOX] VHD error: %s. Saving disabled for %s; previous save retained.", error, impl->save_file.c_str());
 	extern void emuthread_notify(int duration, LOG_SEVERITIES lvl, char const* format,...);
